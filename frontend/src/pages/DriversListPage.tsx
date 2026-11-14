@@ -1,0 +1,424 @@
+import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
+import { DriverAvatar } from '../components/DriverAvatar'
+import {
+  EyeIcon,
+  PencilIcon,
+  PlusIcon,
+  PowerIcon,
+  RefreshIcon,
+  SearchIcon,
+  UsersIcon,
+  XIcon,
+} from '../components/icons'
+import { StatusBadge } from '../components/ui/Badge'
+import { Button, LinkButton } from '../components/ui/Button'
+import { EmptyState } from '../components/ui/EmptyState'
+import { PageHeader } from '../components/ui/PageHeader'
+import { Pagination } from '../components/ui/Pagination'
+import { Spinner } from '../components/ui/Spinner'
+import { useToast } from '../context/ToastContext'
+import { fetchDrivers, setDriverStatus } from '../lib/api'
+import { cn } from '../lib/cn'
+import { formatJalaliShort, toPersianDigits } from '../lib/dates'
+import { getErrorMessage, isAbortError } from '../lib/errors'
+import type { Driver, PaginatedResponse } from '../types/driver'
+
+const PAGE_SIZE = 10
+
+type StatusFilter = '' | 'active' | 'inactive'
+
+const statusOptions: Array<{ value: StatusFilter; label: string }> = [
+  { value: '', label: 'همه' },
+  { value: 'active', label: 'فعال' },
+  { value: 'inactive', label: 'غیرفعال' },
+]
+
+export function DriversListPage() {
+  const [searchInput, setSearchInput] = useState('')
+  const [search, setSearch] = useState('')
+  const [status, setStatus] = useState<StatusFilter>('')
+  const [page, setPage] = useState(1)
+  const [data, setData] = useState<PaginatedResponse<Driver> | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [busyId, setBusyId] = useState<number | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
+  const { notify } = useToast()
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setSearch(searchInput.trim())
+    }, 350)
+    return () => window.clearTimeout(timer)
+  }, [searchInput])
+
+  useEffect(() => {
+    setPage(1)
+  }, [search, status])
+
+  useEffect(() => {
+    let active = true
+    const controller = new AbortController()
+    setLoading(true)
+    setError(null)
+
+    fetchDrivers(
+      { search, status, page, page_size: PAGE_SIZE },
+      controller.signal,
+    )
+      .then((response) => {
+        if (!active) return
+        const totalPages = Math.max(1, Math.ceil(response.count / PAGE_SIZE))
+        if (page > totalPages) {
+          setPage(totalPages)
+          return
+        }
+        setData(response)
+      })
+      .catch((cause) => {
+        if (active && !isAbortError(cause)) {
+          setError(getErrorMessage(cause))
+        }
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+
+    return () => {
+      active = false
+      controller.abort()
+    }
+  }, [search, status, page, reloadKey])
+
+  const handleToggle = async (driver: Driver) => {
+    if (busyId !== null) return
+    setBusyId(driver.id)
+    try {
+      const updated = await setDriverStatus(driver.id, !driver.status)
+      setData((current) =>
+        current
+          ? {
+              ...current,
+              results: current.results.map((item) =>
+                item.id === updated.id
+                  ? {
+                      ...item,
+                      status: updated.status,
+                      status_label: updated.status_label,
+                    }
+                  : item,
+              ),
+            }
+          : current,
+      )
+      notify(
+        'success',
+        updated.status
+          ? `راننده «${updated.full_name}» فعال شد.`
+          : `راننده «${updated.full_name}» غیرفعال شد.`,
+      )
+      if (status !== '') {
+        // The updated row may no longer match the active status filter.
+        setReloadKey((current) => current + 1)
+      }
+    } catch (cause) {
+      notify('error', getErrorMessage(cause))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const totalPages = data ? Math.max(1, Math.ceil(data.count / PAGE_SIZE)) : 1
+  const hasFilters = Boolean(search) || status !== ''
+
+  return (
+    <div className="space-y-5">
+      <PageHeader
+        title="فهرست رانندگان"
+        description="جستجو و مدیریت رانندگان ثبت‌شده. جستجو در سرور انجام می‌شود و شامل نام، پلیت و شماره مسلسل است."
+        actions={
+          <LinkButton
+            to="/drivers/new"
+            icon={<PlusIcon className="size-4" />}
+          >
+            ثبت راننده جدید
+          </LinkButton>
+        }
+      />
+
+      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="relative w-full max-w-md">
+            <SearchIcon className="pointer-events-none absolute start-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
+            <input
+              type="search"
+              value={searchInput}
+              onChange={(event) => setSearchInput(event.target.value)}
+              placeholder="جستجو بر اساس نام، پلیت یا شماره مسلسل…"
+              aria-label="جستجوی رانندگان"
+              className="h-10 w-full rounded-lg border border-slate-300 bg-white pe-9 ps-10 text-sm text-slate-900 shadow-sm outline-none transition placeholder:text-slate-400 focus:border-slate-500 focus:ring-2 focus:ring-slate-900/10"
+            />
+            {searchInput && (
+              <button
+                type="button"
+                onClick={() => setSearchInput('')}
+                className="absolute end-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                aria-label="پاک کردن جستجو"
+              >
+                <XIcon className="size-4" />
+              </button>
+            )}
+          </div>
+
+          <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5 text-xs">
+            {statusOptions.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => setStatus(option.value)}
+                className={cn(
+                  'rounded-md px-3 py-1.5 font-medium transition',
+                  status === option.value
+                    ? 'bg-white text-slate-900 shadow-sm'
+                    : 'text-slate-500 hover:text-slate-700',
+                )}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+          {loading ? (
+            <span className="inline-flex items-center gap-1.5">
+              <Spinner className="size-3.5" />
+              در حال دریافت فهرست…
+            </span>
+          ) : (
+            <span>
+              {data ? toPersianDigits(data.count) : '۰'} راننده یافت شد
+              {hasFilters ? ' (با فیلترهای فعلی)' : ''}
+            </span>
+          )}
+          {hasFilters && (
+            <button
+              type="button"
+              onClick={() => {
+                setSearchInput('')
+                setSearch('')
+                setStatus('')
+              }}
+              className="font-medium text-slate-700 underline-offset-2 hover:underline"
+            >
+              حذف فیلترها
+            </button>
+          )}
+        </div>
+      </div>
+
+      {error ? (
+        <div className="flex flex-col items-center gap-3 rounded-xl border border-rose-200 bg-rose-50 px-6 py-12 text-center">
+          <p className="text-sm text-rose-700">{error}</p>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setReloadKey((current) => current + 1)}
+            icon={<RefreshIcon className="size-4" />}
+          >
+            تلاش دوباره
+          </Button>
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[820px] text-sm">
+              <thead className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500">
+                <tr>
+                  <th className="px-4 py-3 text-right font-medium">
+                    شماره مسلسل
+                  </th>
+                  <th className="px-4 py-3 text-right font-medium">نام راننده</th>
+                  <th className="px-4 py-3 text-right font-medium">پلیت موتر</th>
+                  <th className="px-4 py-3 text-right font-medium">تاریخ ثبت</th>
+                  <th className="px-4 py-3 text-right font-medium">وضعیت</th>
+                  <th className="px-4 py-3 text-left font-medium">عملیات</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {loading
+                  ? Array.from({ length: 6 }, (_, index) => (
+                      <tr key={`skeleton-${index}`} className="animate-pulse">
+                        <td className="px-4 py-3.5">
+                          <div className="h-4 w-20 rounded bg-slate-100" />
+                        </td>
+                        <td className="px-4 py-3.5">
+                          <div className="flex items-center gap-3">
+                            <div className="size-9 rounded-full bg-slate-100" />
+                            <div className="h-4 w-32 rounded bg-slate-100" />
+                          </div>
+                        </td>
+                        <td className="px-4 py-3.5">
+                          <div className="h-4 w-24 rounded bg-slate-100" />
+                        </td>
+                        <td className="px-4 py-3.5">
+                          <div className="h-4 w-24 rounded bg-slate-100" />
+                        </td>
+                        <td className="px-4 py-3.5">
+                          <div className="h-6 w-16 rounded-full bg-slate-100" />
+                        </td>
+                        <td className="px-4 py-3.5">
+                          <div className="ms-auto h-8 w-24 rounded-lg bg-slate-100" />
+                        </td>
+                      </tr>
+                    ))
+                  : data?.results.map((driver) => (
+                      <tr
+                        key={driver.id}
+                        className="transition hover:bg-slate-50/70"
+                      >
+                        <td className="px-4 py-3">
+                          <Link
+                            to={`/drivers/${driver.id}`}
+                            className="font-mono text-xs font-medium text-slate-700 hover:text-slate-950"
+                            dir="ltr"
+                          >
+                            {driver.driver_code}
+                          </Link>
+                        </td>
+                        <td className="px-4 py-3">
+                          <Link
+                            to={`/drivers/${driver.id}`}
+                            className="flex items-center gap-3"
+                          >
+                            <DriverAvatar
+                              src={driver.photo_url}
+                              name={driver.full_name}
+                              className="size-9 rounded-full text-xs"
+                            />
+                            <span className="font-medium text-slate-800 hover:text-slate-950">
+                              {driver.full_name}
+                            </span>
+                          </Link>
+                        </td>
+                        <td className="px-4 py-3">
+                          <Link
+                            to={`/drivers/${driver.id}`}
+                            className="font-mono text-xs text-slate-600 hover:text-slate-900"
+                            dir="ltr"
+                          >
+                            {driver.plate_number}
+                          </Link>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-slate-500">
+                          {formatJalaliShort(driver.registration_date)}
+                        </td>
+                        <td className="px-4 py-3">
+                          <StatusBadge active={driver.status} />
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center justify-end gap-1">
+                            <Link
+                              to={`/drivers/${driver.id}`}
+                              className="inline-flex size-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+                              aria-label={`مشاهده پروفایل ${driver.full_name}`}
+                              title="مشاهده پروفایل"
+                            >
+                              <EyeIcon className="size-4" />
+                            </Link>
+                            <Link
+                              to={`/drivers/${driver.id}/edit`}
+                              className="inline-flex size-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+                              aria-label={`ویرایش ${driver.full_name}`}
+                              title="ویرایش"
+                            >
+                              <PencilIcon className="size-4" />
+                            </Link>
+                            <button
+                              type="button"
+                              onClick={() => handleToggle(driver)}
+                              disabled={busyId !== null}
+                              className={cn(
+                                'inline-flex size-8 items-center justify-center rounded-lg transition disabled:opacity-40',
+                                driver.status
+                                  ? 'text-amber-600 hover:bg-amber-50'
+                                  : 'text-emerald-600 hover:bg-emerald-50',
+                              )}
+                              aria-label={
+                                driver.status
+                                  ? `غیرفعال کردن ${driver.full_name}`
+                                  : `فعال کردن ${driver.full_name}`
+                              }
+                              title={
+                                driver.status
+                                  ? 'غیرفعال کردن راننده'
+                                  : 'فعال کردن راننده'
+                              }
+                            >
+                              {busyId === driver.id ? (
+                                <Spinner className="size-4" />
+                              ) : (
+                                <PowerIcon className="size-4" />
+                              )}
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+              </tbody>
+            </table>
+          </div>
+
+          {!loading && data && data.results.length === 0 && (
+            <EmptyState
+              icon={<UsersIcon className="size-6" />}
+              title={
+                hasFilters
+                  ? 'راننده‌ای با این مشخصات یافت نشد'
+                  : 'هنوز راننده‌ای ثبت نشده است'
+              }
+              description={
+                hasFilters
+                  ? 'عبارت جستجو یا فیلتر وضعیت را تغییر دهید.'
+                  : 'برای شروع، اولین راننده را با شماره مسلسل دستی ثبت کنید.'
+              }
+              action={
+                hasFilters ? (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => {
+                      setSearchInput('')
+                      setSearch('')
+                      setStatus('')
+                    }}
+                  >
+                    حذف فیلترها
+                  </Button>
+                ) : (
+                  <LinkButton
+                    to="/drivers/new"
+                    size="sm"
+                    icon={<PlusIcon className="size-4" />}
+                  >
+                    ثبت اولین راننده
+                  </LinkButton>
+                )
+              }
+            />
+          )}
+
+          {!loading && data && data.results.length > 0 && (
+            <Pagination
+              page={page}
+              totalPages={totalPages}
+              totalItems={data.count}
+              onChange={setPage}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

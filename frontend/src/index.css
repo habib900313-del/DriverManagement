@@ -1,0 +1,99 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans:
+    "Vazirmatn Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply min-h-screen bg-slate-100 font-sans text-slate-900 antialiased;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+
+  ::selection {
+    @apply bg-slate-900 text-white;
+  }
+
+  input[type="date"] {
+    color-scheme: light;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Print styles — the cash revenue report is printed / saved as PDF from the
+   browser. Only the report sheet is printed; the application chrome is hidden.
+   --------------------------------------------------------------------------- */
+@page {
+  size: A4 portrait;
+  margin: 12mm 10mm;
+}
+
+@media print {
+  html,
+  body {
+    background: #fff !important;
+    min-height: auto !important;
+  }
+
+  /* the application shell: sidebar, top bar, overlays */
+  aside,
+  header.sticky,
+  nav,
+  [data-print='hide'] {
+    display: none !important;
+  }
+
+  .print\:hidden {
+    display: none !important;
+  }
+
+  /* the report sheet is hidden on screen but printed */
+  .print\:block {
+    display: block !important;
+  }
+
+  .print-sheet {
+    direction: rtl;
+    font-family: "Vazirmatn Variable", ui-sans-serif, system-ui, sans-serif;
+    color: #000;
+    width: 100%;
+  }
+
+  .print-sheet table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .print-sheet th,
+  .print-sheet td {
+    border: 1px solid #cbd5e1;
+    padding: 4pt 6pt;
+  }
+
+  .print-sheet thead {
+    display: table-header-group;
+  }
+
+  .print-sheet tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .print-sheet section {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}

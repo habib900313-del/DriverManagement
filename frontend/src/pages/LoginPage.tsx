@@ -1,0 +1,229 @@
+import { useEffect, useState } from 'react'
+import type { FormEvent } from 'react'
+import { Navigate, useLocation, useNavigate } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext'
+import { ensureCsrfCookie } from '../lib/api'
+import { getErrorMessage } from '../lib/errors'
+import {
+  AlertCircleIcon,
+  CheckIcon,
+  EyeIcon,
+  EyeOffIcon,
+  LockIcon,
+  ShieldIcon,
+  UserIcon,
+} from '../components/icons'
+import { Spinner } from '../components/ui/Spinner'
+
+export function LoginPage() {
+  const { user, loading, login } = useAuth()
+  const navigate = useNavigate()
+  const location = useLocation()
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    // Prime the CSRF cookie before the first login attempt.
+    void ensureCsrfCookie().catch(() => undefined)
+  }, [])
+
+  if (!loading && user) {
+    return <Navigate to="/" replace />
+  }
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (submitting) return
+
+    if (!username.trim() || !password) {
+      setError('نام کاربری و رمز عبور را وارد کنید.')
+      return
+    }
+
+    setSubmitting(true)
+    setError(null)
+    try {
+      await login(username.trim(), password)
+      const from = (location.state as { from?: string } | null)?.from
+      navigate(from && from !== '/login' ? from : '/', { replace: true })
+    } catch (cause) {
+      setError(getErrorMessage(cause))
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-100">
+        <Spinner className="size-8 text-slate-400" />
+      </div>
+    )
+  }
+
+  return (
+    <div className="grid min-h-screen bg-slate-100 lg:grid-cols-[1.05fr_1fr]">
+      <div className="relative hidden overflow-hidden bg-slate-900 p-12 text-white lg:flex lg:flex-col lg:justify-between">
+        <div className="absolute -left-24 -top-24 size-72 rounded-full bg-white/5" />
+        <div className="absolute -bottom-32 -right-16 size-96 rounded-full bg-white/5" />
+        <div className="relative">
+          <div className="flex items-center gap-3">
+            <span className="flex size-11 items-center justify-center rounded-2xl bg-white/10 ring-1 ring-white/15">
+              <ShieldIcon className="size-6" />
+            </span>
+            <div>
+              <p className="text-base font-bold">سیستم مدیریت رانندگان</p>
+              <p className="text-xs text-slate-400">نسخه اداری محلی</p>
+            </div>
+          </div>
+
+          <h1 className="mt-16 max-w-md text-3xl font-bold leading-snug">
+            مدیریت منظم رانندگان، از ثبت تا پیگیری وضعیت
+          </h1>
+          <p className="mt-4 max-w-md text-sm leading-7 text-slate-300">
+            ثبت شماره مسلسل دستی، نگهداری مشخصات و عکس، جستجوی سریع و مدیریت
+            فعال یا غیرفعال بودن رانندگان — همه در یک محیط امن و محلی.
+          </p>
+
+          <ul className="mt-10 space-y-3 text-sm text-slate-300">
+            {[
+              'اطلاعات فقط روی همین دستگاه ذخیره می‌شود',
+              'دسترسی به اطلاعات تنها پس از ورود مدیر',
+              'پشتیبانی از تقویم شمسی و میلادی',
+            ].map((item) => (
+              <li key={item} className="flex items-center gap-2.5">
+                <span className="flex size-5 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-400">
+                  <CheckIcon className="size-3" />
+                </span>
+                {item}
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        <p className="relative text-xs text-slate-500">
+          داده‌های این سیستم شامل اطلاعات شخصی رانندگان است؛ دسترسی غیرمجاز
+          ممنوع می‌باشد.
+        </p>
+      </div>
+
+      <div className="flex items-center justify-center px-4 py-10 sm:px-8">
+        <div className="w-full max-w-md">
+          <div className="mb-8 flex items-center gap-3 lg:hidden">
+            <span className="flex size-10 items-center justify-center rounded-xl bg-slate-900 text-white">
+              <ShieldIcon className="size-5" />
+            </span>
+            <div>
+              <p className="text-sm font-bold text-slate-900">
+                سیستم مدیریت رانندگان
+              </p>
+              <p className="text-xs text-slate-500">نسخه اداری محلی</p>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xl shadow-slate-900/5 sm:p-8">
+            <div>
+              <h2 className="text-xl font-bold text-slate-900">ورود مدیر سیستم</h2>
+              <p className="mt-1 text-sm leading-6 text-slate-500">
+                برای دسترسی به اطلاعات رانندگان، نام کاربری و رمز عبور خود را
+                وارد کنید.
+              </p>
+            </div>
+
+            {error && (
+              <div
+                className="mt-5 flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-sm text-rose-700"
+                role="alert"
+              >
+                <AlertCircleIcon className="mt-0.5 size-4 shrink-0" />
+                <span>{error}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleSubmit} className="mt-6 space-y-4">
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="username"
+                  className="block text-sm font-medium text-slate-700"
+                >
+                  نام کاربری
+                </label>
+                <div className="relative">
+                  <UserIcon className="pointer-events-none absolute start-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
+                  <input
+                    id="username"
+                    name="username"
+                    autoComplete="username"
+                    dir="ltr"
+                    value={username}
+                    onChange={(event) => setUsername(event.target.value)}
+                    className="h-11 w-full rounded-lg border border-slate-300 bg-white pe-3 ps-10 text-sm text-slate-900 shadow-sm outline-none transition placeholder:text-slate-400 focus:border-slate-500 focus:ring-2 focus:ring-slate-900/10"
+                    placeholder="نام کاربری مدیر"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="password"
+                  className="block text-sm font-medium text-slate-700"
+                >
+                  رمز عبور
+                </label>
+                <div className="relative">
+                  <LockIcon className="pointer-events-none absolute start-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
+                  <input
+                    id="password"
+                    name="password"
+                    type={showPassword ? 'text' : 'password'}
+                    autoComplete="current-password"
+                    dir="ltr"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    className="h-11 w-full rounded-lg border border-slate-300 bg-white pe-11 ps-10 text-sm text-slate-900 shadow-sm outline-none transition placeholder:text-slate-400 focus:border-slate-500 focus:ring-2 focus:ring-slate-900/10"
+                    placeholder="رمز عبور"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((current) => !current)}
+                    className="absolute end-2 top-1/2 -translate-y-1/2 rounded-md p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                    aria-label={
+                      showPassword ? 'پنهان کردن رمز عبور' : 'نمایش رمز عبور'
+                    }
+                  >
+                    {showPassword ? (
+                      <EyeOffIcon className="size-4" />
+                    ) : (
+                      <EyeIcon className="size-4" />
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={submitting}
+                className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-slate-900 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:pointer-events-none disabled:opacity-60"
+              >
+                {submitting && <Spinner className="size-4" />}
+                {submitting ? 'در حال ورود…' : 'ورود به سیستم'}
+              </button>
+            </form>
+
+            <p className="mt-6 border-t border-slate-100 pt-4 text-center text-xs leading-5 text-slate-400">
+              ایجاد حساب کاربری از طریق این صفحه ممکن نیست. حساب مدیر توسط
+              مدیر سیستم ساخته می‌شود.
+            </p>
+          </div>
+
+          <p className="mt-6 text-center text-xs text-slate-400">
+            تمام اطلاعات روی همین دستگاه ذخیره می‌شود.
+          </p>
+        </div>
+      </div>
+    </div>
+  )
+}
