@@ -113,7 +113,7 @@ export function AllocationCorrectPage() {
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
             <Field label="دلیل اصلاح (زامی)" required>
               <input
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                className="block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr shadow-xs outline-none transition hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
                 defaultValue={form.reason}
                 onChange={(e) => handleChange('reason', e.target.value)}
                 placeholder="دلیل اصلاح تخصصی را بنویسید"
@@ -122,7 +122,7 @@ export function AllocationCorrectPage() {
 
             <Field label="تاریخ شروع دوره جدید (شمسی)" required>
               <input
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                className="block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr shadow-xs outline-none transition hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
                 defaultValue={form.new_target_period_start}
                 onChange={(e) => handleChange('new_target_period_start', e.target.value)}
                 placeholder="۱۴۰۵/۰۸/۲۰"
@@ -131,7 +131,7 @@ export function AllocationCorrectPage() {
 
             <Field label="تاریخ پایان دوره جدید (شمسی)" required>
               <input
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                className="block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr shadow-xs outline-none transition hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
                 defaultValue={form.new_target_period_end}
                 onChange={(e) => handleChange('new_target_period_end', e.target.value)}
                 placeholder="۱۴۰۵/۱۱/۱۹"
@@ -139,9 +139,9 @@ export function AllocationCorrectPage() {
             </Field>
           </div>
 
-          <div className="alert alert-info bg-blue-50 border-blue-200 p-4 rounded-lg">
-            <h3 className="text-sm font-semibold text-blue-800">نکته مهم</h3>
-            <p className="mt-1 text-sm text-blue-700">
+          <div className="rounded-xl border border-brand-200 bg-brand-50 p-4">
+            <h3 className="text-sm font-semibold text-brand-800">نکته مهم</h3>
+            <p className="mt-1 text-sm text-brand-700">
               فقط تخصیص‌های نوع "فیس دوره" قابل اصلاح هستند. تخصیص‌های اعتباری باabhängی به مصرف‌ها
               باید از طریق صفحه "اصلاح تخصیص اعتباری" اصلاح شوند.
             </p>

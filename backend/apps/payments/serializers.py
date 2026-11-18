@@ -5,6 +5,8 @@ validate shape/types. Actor fields (created_by/allocated_by/...) always come
 from request.user in the view, never from the client (§10.1).
 """
 
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from apps.drivers.models import DriverFeeHistory
@@ -16,7 +18,9 @@ from .models import (
     OnlinePayment,
     Payment,
     PaymentAllocation,
+    PaymentRefund,
     validate_not_future_date,
+    validate_whole_afn,
 )
 
 
@@ -76,11 +80,37 @@ class PaymentAllocationSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class PaymentRefundSerializer(serializers.ModelSerializer):
+    refunded_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PaymentRefund
+        fields = [
+            "id",
+            "payment",
+            "amount",
+            "refund_date",
+            "effective_date",
+            "reason",
+            "refunded_by",
+            "refunded_by_name",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_refunded_by_name(self, obj):
+        return obj.refunded_by.get_full_name() or obj.refunded_by.username
+
+
 class PaymentSerializer(serializers.ModelSerializer):
     is_void = serializers.BooleanField(read_only=True)
     driver_code = serializers.CharField(source="driver.driver_code", read_only=True)
     driver_name = serializers.CharField(source="driver.full_name", read_only=True)
     allocations = PaymentAllocationSerializer(many=True, read_only=True)
+    refunds = PaymentRefundSerializer(many=True, read_only=True)
+    corrected_by_name = serializers.SerializerMethodField()
+    refunded_total = serializers.SerializerMethodField()
+    refundable_amount = serializers.SerializerMethodField()
 
     class Meta:
         model = Payment
@@ -93,6 +123,7 @@ class PaymentSerializer(serializers.ModelSerializer):
             "payment_date",
             "effective_date",
             "receipt_number",
+            "description",
             "idempotency_key",
             "status",
             "is_void",
@@ -101,12 +132,30 @@ class PaymentSerializer(serializers.ModelSerializer):
             "correction_reason",
             "voided_at",
             "corrected_at",
+            "corrected_by",
+            "corrected_by_name",
             "created_by",
             "created_at",
             "updated_at",
             "allocations",
+            "refunds",
+            "refunded_total",
+            "refundable_amount",
         ]
         read_only_fields = fields
+
+    def get_corrected_by_name(self, obj):
+        if obj.corrected_by:
+            return obj.corrected_by.get_full_name() or obj.corrected_by.username
+        return None
+
+    def get_refunded_total(self, obj):
+        return sum((refund.amount for refund in obj.refunds.all()), Decimal("0.00"))
+
+    def get_refundable_amount(self, obj):
+        if obj.status != "received":
+            return Decimal("0.00")
+        return max(Decimal("0.00"), obj.amount - self.get_refunded_total(obj))
 
 
 class AdjustmentSerializer(serializers.ModelSerializer):
@@ -171,6 +220,7 @@ class ReceivePaymentInput(serializers.Serializer):
     payment_date = serializers.DateField()
     target_period_start = serializers.DateField(required=False, allow_null=True)
     target_period_end = serializers.DateField(required=False, allow_null=True)
+    description = serializers.CharField(required=False, allow_blank=True, default="")
     periods_count = serializers.IntegerField(
         required=False,
         default=1,
@@ -183,6 +233,17 @@ class ReceivePaymentInput(serializers.Serializer):
 
 
 class ReasonInput(serializers.Serializer):
+    reason = serializers.CharField()
+
+
+class PaymentRefundInput(serializers.Serializer):
+    amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=Decimal("0.01"),
+        validators=[validate_whole_afn],
+    )
+    refund_date = serializers.DateField(validators=[validate_not_future_date])
     reason = serializers.CharField()
 
 

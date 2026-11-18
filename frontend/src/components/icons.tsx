@@ -290,6 +290,22 @@ export function PowerIcon(props: IconProps) {
   )
 }
 
+export function ArchiveIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3 4h18v4H3zM5 8v12h14V8M10 12h4" />
+    </Svg>
+  )
+}
+
+export function RestoreIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3 4h18v4H3zM5 8v12h14V8M9 14l3-3 3 3M12 11v6" />
+    </Svg>
+  )
+}
+
 export function ImageIcon(props: IconProps) {
   return (
     <Svg {...props}>

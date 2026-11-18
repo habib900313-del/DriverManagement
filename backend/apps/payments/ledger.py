@@ -17,6 +17,7 @@ from .models import (
     AllocationConsumption,
     AllocationType,
     PaymentAllocation,
+    PaymentRefund,
     PaymentStatus,
 )
 from .periods import fee_for_period, reconstruct_periods
@@ -101,6 +102,11 @@ class DriverLedger:
                 "payment"
             )
         )
+        self.refunds = list(
+            PaymentRefund.objects.filter(payment__driver=driver).select_related(
+                "payment"
+            )
+        )
         self.consumptions = list(
             AllocationConsumption.objects.filter(
                 source_allocation__payment__driver=driver
@@ -154,6 +160,9 @@ class DriverLedger:
 
     def allocation_active(self, allocation) -> bool:
         return record_active_as_of(allocation, self.as_of)
+
+    def refund_active(self, refund) -> bool:
+        return refund.effective_date <= self.as_of
 
     def consumption_active(self, consumption) -> bool:
         return record_active_as_of(consumption, self.as_of)
@@ -365,19 +374,38 @@ class DriverLedger:
             ZERO,
         )
 
+    def refund_total(self, payment) -> Decimal:
+        return sum(
+            (
+                refund.amount
+                for refund in self.refunds
+                if refund.payment_id == payment.id and self.refund_active(refund)
+            ),
+            ZERO,
+        )
+
+    def net_payment_amount(self, payment) -> Decimal:
+        return payment.amount - self.refund_total(payment)
+
     def unallocated(self, payment) -> Decimal:
-        return payment.amount - self.active_allocation_total(payment)
+        return self.net_payment_amount(payment) - self.active_allocation_total(payment)
 
     # -- revenue (F1–F6) ---------------------------------------------------
     def cash_received(self) -> Decimal:
         """F2 at self.as_of (F1 when as_of == today)."""
-        return sum(
-            (p.amount for p in self.payments if self.payment_valid(p)), ZERO
+        payments = sum(
+            (
+                self.net_payment_amount(payment)
+                for payment in self.payments
+                if self.payment_valid(payment)
+            ),
+            ZERO,
         )
+        return payments
 
     def cash_received_range(self, d1: date, d2: date) -> Decimal:
         """F4 at self.as_of (F3 when as_of == today)."""
-        return sum(
+        receipts = sum(
             (
                 p.amount
                 for p in self.payments
@@ -385,9 +413,31 @@ class DriverLedger:
             ),
             ZERO,
         )
+        refunds = sum(
+            (
+                refund.amount
+                for refund in self.refunds
+                if self.payment_valid(refund.payment)
+                and self.refund_active(refund)
+                and d1 <= refund.refund_date <= d2
+            ),
+            ZERO,
+        )
+        return receipts - refunds
 
     def cash_recorded(self) -> Decimal:
         """F5b audit-only predicate."""
-        return sum(
+        receipts = sum(
             (p.amount for p in self.payments if self.payment_recorded(p)), ZERO
         )
+        refunds = sum(
+            (
+                refund.amount
+                for refund in self.refunds
+                if self.payment_recorded(refund.payment)
+                and self.refund_active(refund)
+                and local_date(refund.created_at) <= self.as_of
+            ),
+            ZERO,
+        )
+        return receipts - refunds

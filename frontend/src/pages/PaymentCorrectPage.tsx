@@ -1,80 +1,144 @@
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
-import { ArrowRightIcon, CalendarIcon, RefreshIcon } from '../components/icons'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import {
+  AlertTriangleIcon,
+  ArrowRightIcon,
+  CheckIcon,
+  CreditCardIcon,
+  InfoIcon,
+  PencilIcon,
+  RefreshIcon,
+} from '../components/icons'
 import { Button } from '../components/ui/Button'
-import { Field } from '../components/ui/Field'
-import { PageHeader } from '../components/ui/PageHeader'
+import { Field, inputClass } from '../components/ui/Field'
 import { useToast } from '../context/ToastContext'
-import { correctPayment } from '../lib/api'
+import { correctPayment, fetchPayment } from '../lib/api'
+import { cn } from '../lib/cn'
+import { formatJalaliShort, toPersianDigits } from '../lib/dates'
 import { getErrorMessage, isAbortError } from '../lib/errors'
-import type { CorrectPaymentInput } from '../types/financial'
+import { getPaymentCorrectionDisabledReason } from '../lib/payments'
+import type { PaymentListItem } from '../types/financial'
+
+interface CorrectionForm {
+  reason: string
+  amount: string
+  paymentDate: string
+}
 
 export function PaymentCorrectPage() {
   const { id } = useParams()
+  const [searchParams] = useSearchParams()
+  const requestedReturnTo = searchParams.get('returnTo')
+  const returnTo =
+    requestedReturnTo && /^\/drivers\/\d+$/.test(requestedReturnTo)
+      ? requestedReturnTo
+      : null
   const paymentId = Number(id)
   const navigate = useNavigate()
+  const { notify } = useToast()
+  const [payment, setPayment] = useState<PaymentListItem | null>(null)
+  const [form, setForm] = useState<CorrectionForm>({
+    reason: '',
+    amount: '',
+    paymentDate: '',
+  })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
-  const [form, setForm] = useState<CorrectPaymentInput>({
-    reason: '',
-    new_amount: '',
-    new_driver_id: undefined,
-    new_payment_date: '',
-    target_period_start: '',
-    target_period_end: '',
-  })
-  const { notify } = useToast()
+  const [retry, setRetry] = useState(0)
 
   useEffect(() => {
-    setLoading(false)
-  }, [])
+    if (!Number.isInteger(paymentId) || paymentId <= 0) {
+      return
+    }
 
-  const handleChange = (key: keyof CorrectPaymentInput, value: string) => {
-    setForm((prev) => ({ ...prev, [key]: value }))
+    const controller = new AbortController()
+    fetchPayment(paymentId, controller.signal)
+      .then((result) => {
+        setPayment(result)
+        setForm({
+          reason: '',
+          amount: result.amount,
+          paymentDate: result.payment_date,
+        })
+      })
+      .catch((cause) => {
+        if (!isAbortError(cause)) setError(getErrorMessage(cause))
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false)
+      })
+    return () => controller.abort()
+  }, [paymentId, retry])
+
+  const isLoading = loading || (!error && payment?.id !== paymentId)
+  const retryLoad = () => {
+    setError(null)
+    setLoading(true)
+    setRetry((value) => value + 1)
   }
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
+  if (!Number.isInteger(paymentId) || paymentId <= 0) {
+    return <p className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700 shadow-xs">شناسه پرداخت معتبر نیست.</p>
+  }
+
+  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!payment) return
+
+    const amountChanged = form.amount !== payment.amount
+    const dateChanged = form.paymentDate !== payment.payment_date
+    if (!form.reason.trim()) {
+      const message = 'دلیل اصلاح الزامی است.'
+      setError(message)
+      notify('error', message)
+      return
+    }
+    if (!amountChanged && !dateChanged) {
+      const message = 'مبلغ یا تاریخ پرداخت را تغییر دهید.'
+      setError(message)
+      notify('error', message)
+      return
+    }
+
     setSubmitting(true)
     setError(null)
     try {
-      const payload: CorrectPaymentInput = {
-        reason: form.reason,
-        new_amount: form.new_amount || undefined,
-        new_driver_id: form.new_driver_id,
-        new_payment_date: form.new_payment_date || undefined,
-        target_period_start: form.target_period_start || undefined,
-        target_period_end: form.target_period_end || undefined,
-      }
-      await correctPayment(paymentId, payload)
-      notify('success', 'پرداخت با موفقیت اصلاح شد.')
-      navigate(`/financial`)
+      const replacement = await correctPayment(payment.id, {
+        reason: form.reason.trim(),
+        new_amount: amountChanged ? form.amount : undefined,
+        new_payment_date: dateChanged ? form.paymentDate : undefined,
+      })
+      notify('success', 'پرداخت اصلاح شد؛ سابقه اصلی و reversal حفظ شده‌اند.')
+      navigate(returnTo ?? `/financial/payments/${replacement.id}`)
     } catch (cause) {
       if (!isAbortError(cause)) {
-        const msg = getErrorMessage(cause)
-        setError(msg)
-        notify('error', msg)
+        const message = getErrorMessage(cause)
+        setError(message)
+        notify('error', message)
       }
     } finally {
       setSubmitting(false)
     }
   }
 
-  if (loading) {
+  if (isLoading) {
     return (
-      <div className="flex min-h-72 flex-col items-center justify-center gap-3 rounded-xl border border-slate-200 bg-white text-slate-500 shadow-sm">
-        <div className="size-7 animate-spin rounded-full border-4 border-slate-200 border-t-slate-900" />
-        <p className="text-sm">در حال بارگذاری…</p>
+      <div className="flex flex-col items-center gap-3 rounded-2xl border border-slate-200 bg-white p-10 text-center shadow-sm">
+        <span className="size-8 animate-spin rounded-full border-2 border-brand-200 border-t-brand-600" />
+        <p className="text-sm text-slate-500">در حال بارگذاری پرداخت…</p>
       </div>
     )
   }
 
   if (error) {
     return (
-      <div className="flex flex-col items-center gap-4 rounded-xl border border-rose-200 bg-rose-50 px-6 py-14 text-center">
+      <div className="flex flex-col items-center gap-4 rounded-2xl border border-rose-200 bg-rose-50 px-6 py-14 text-center">
+        <span className="grid size-11 place-items-center rounded-full bg-rose-100 text-rose-600">
+          <AlertTriangleIcon className="size-5" />
+        </span>
         <p className="text-sm text-rose-700">{error}</p>
-        <Button variant="secondary" size="sm" onClick={() => window.location.reload()}>
+        <Button variant="secondary" size="sm" onClick={retryLoad}>
           <RefreshIcon className="size-4" />
           تلاش دوباره
         </Button>
@@ -82,115 +146,186 @@ export function PaymentCorrectPage() {
     )
   }
 
-  if (!Number.isInteger(paymentId) || paymentId <= 0) {
-    return (
-      <div className="flex flex-col items-center gap-4 rounded-xl border border-rose-200 bg-rose-50 px-6 py-14 text-center">
-        <p className="text-sm text-rose-700">شناسه پرداخت معتبر نیست.</p>
-        <Link
-          to="/financial"
-          className="inline-flex h-9 items-center gap-1.5 rounded-lg px-3 text-xs font-medium text-slate-600 transition hover:bg-white/60"
-        >
-          <ArrowRightIcon className="size-4" />
-          بازگشت به داشبورد
-        </Link>
-      </div>
-    )
-  }
+  if (!payment) return null
+  const correctionBlockedReason = getPaymentCorrectionDisabledReason(payment)
+  const amountChanged = form.amount !== payment.amount
+  const dateChanged = form.paymentDate !== payment.payment_date
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between gap-3">
-        <Link
-          to="/financial"
-          className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-600 transition hover:text-slate-900"
-        >
-          <ArrowRightIcon className="size-4" />
-          بازگشت به داشبورد مالی
-        </Link>
-      </div>
+      <Link
+        to={`/financial/payments/${payment.id}`}
+        className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-600 transition-colors hover:text-brand-700"
+      >
+        <ArrowRightIcon className="size-4" />
+        بازگشت به جزئیات پرداخت
+      </Link>
 
-      <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-        <PageHeader
-          title="اصلاح پرداخت"
-          description="اصلاح مبلغ یا تاریخ یا دوره هدف یک پرداخت ثبت‌شده. پرداخت اصلی حفظ شده و یک رکورد جدید ایجاد می‌شود."
-        />
-
-        <form onSubmit={handleSubmit} className="p-5 space-y-5">
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            <Field label="دلیل اصلاح (زامی)" required>
-              <input
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={form.reason}
-                onChange={(e) => handleChange('reason', e.target.value)}
-                placeholder="دلیل اصلاح را بنویسید"
-              />
-            </Field>
-
-            <Field label="مبلغ جدید (اختیاری - افغانی)">
-              <input
-                type="text"
-                inputMode="numeric"
-                pattern="[0-9]*"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 font-mono dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={form.new_amount || ''}
-                onChange={(e) => handleChange('new_amount', e.target.value)}
-                placeholder="مبلغ جدید را وارد کنید"
-              />
-            </Field>
-
-            <Field label="تاریخ پرداخت جدید (اختیاری - شمسی)">
-              <input
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={form.new_payment_date || ''}
-                onChange={(e) => handleChange('new_payment_date', e.target.value)}
-                placeholder="۱۴۰۵/۰۸/۲۰"
-              />
-            </Field>
-
-            <Field label="دوره هدف جدید - شروع (اختیاری - شمسی)">
-              <input
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={form.target_period_start || ''}
-                onChange={(e) => handleChange('target_period_start', e.target.value)}
-                placeholder="۱۴۰۵/۰۸/۲۰"
-              />
-            </Field>
-
-            <Field label="دوره هدف جدید - پایان (اختیاری - شمسی)">
-              <input
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={form.target_period_end || ''}
-                onChange={(e) => handleChange('target_period_end', e.target.value)}
-                placeholder="۱۴۰۵/۱۱/۱۹"
-              />
-            </Field>
+      <section className="animate-fade-in-up overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <div className="relative overflow-hidden bg-gradient-to-bl from-brand-700 via-brand-600 to-cyan-500 px-5 py-6 text-white sm:px-6">
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute -top-16 left-0 size-48 rounded-full bg-white/15 blur-2xl"
+          />
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute -bottom-24 right-0 size-56 rounded-full bg-cyan-300/25 blur-3xl"
+          />
+          <div className="relative flex items-start gap-4">
+            <span className="grid size-12 shrink-0 place-items-center rounded-2xl bg-white/15 ring-1 ring-inset ring-white/25 backdrop-blur-sm">
+              <PencilIcon className="size-6" />
+            </span>
+            <div className="min-w-0">
+              <p className="text-xs font-medium tracking-wide text-white/70">گردش مالی · اصلاح پرداخت</p>
+              <h1 className="mt-0.5 text-xl font-bold tracking-tight sm:text-2xl">اصلاح پرداخت</h1>
+              <p className="mt-1.5 max-w-2xl text-sm leading-6 text-white/85">
+                پرداخت اصلی حذف نمی‌شود؛ تخصیص‌های آن برگشت می‌خورند و یک پرداخت اصلاحی جدید ثبت می‌شود.
+              </p>
+            </div>
           </div>
+        </div>
 
-          <div className="alert alert-info bg-blue-50 border-blue-200 p-4 rounded-lg">
-            <h3 className="text-sm font-semibold text-blue-800">نکته مهم</h3>
-            <p className="mt-1 text-sm text-blue-700">
-              پرداخت اصلی حذف نمی‌شود و تنها وضعیت آن به "اصلاح‌شده" تغییر می‌کند.
-              یک پرداخت جدید با مبلغ اصلاح شده ایجاد می‌شود و فقط مبلغ جدید در گزارش‌های نقدی شمارش می‌شود.
-            </p>
+        {correctionBlockedReason ? (
+          <div className="p-5 sm:p-6">
+            <div className="flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800 shadow-xs">
+              <AlertTriangleIcon className="mt-0.5 size-5 shrink-0" />
+              <p className="leading-6">{correctionBlockedReason}</p>
+            </div>
           </div>
+        ) : (
+          <form onSubmit={handleSubmit} className="space-y-5 p-5 sm:p-6">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
+              <div className="flex min-w-0 items-center gap-3">
+                <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-white text-brand-600 ring-1 ring-brand-100">
+                  <CreditCardIcon className="size-5" />
+                </span>
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold text-slate-800">
+                    پرداخت #{toPersianDigits(payment.id)} — {payment.driver_name}
+                  </p>
+                  <p className="truncate text-xs text-slate-500">
+                    {payment.driver_code} · دریافت: {formatJalaliShort(payment.payment_date)}
+                    {payment.receipt_number ? ` · رسید ${payment.receipt_number}` : ''}
+                  </p>
+                </div>
+              </div>
+              <span className="rounded-lg bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 shadow-xs ring-1 ring-slate-200">
+                مبلغ فعلی: {toPersianDigits(payment.amount)} AFN
+              </span>
+            </div>
 
-          <div className="flex items-center gap-3 pt-2">
-            <Button type="submit" loading={submitting} icon={<CalendarIcon className="size-4" />}>
-              ثبت اصلاح
-            </Button>
-            <Button variant="secondary" size="sm" type="button" onClick={() => setForm({
-              reason: '',
-              new_amount: '',
-              new_driver_id: undefined,
-              new_payment_date: '',
-              target_period_start: '',
-              target_period_end: '',
-            })}>
-              پاک کردن فرم
-            </Button>
-          </div>
-        </form>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <ChangePreview
+                label="مبلغ (AFN)"
+                before={`${toPersianDigits(payment.amount)} AFN`}
+                after={`${toPersianDigits(form.amount || payment.amount)} AFN`}
+                changed={amountChanged}
+              />
+              <ChangePreview
+                label="تاریخ پرداخت"
+                before={formatJalaliShort(payment.payment_date)}
+                after={formatJalaliShort(form.paymentDate || payment.payment_date)}
+                changed={dateChanged}
+              />
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="دلیل اصلاح" required className="sm:col-span-2">
+                <input
+                  className={inputClass}
+                  required
+                  value={form.reason}
+                  onChange={(event) => setForm((current) => ({ ...current, reason: event.target.value }))}
+                  placeholder="دلیل اصلاح را ثبت کنید"
+                />
+              </Field>
+              <Field label="مبلغ اصلاح‌شده (AFN)" required>
+                <input
+                  className={inputClass}
+                  type="number"
+                  inputMode="numeric"
+                  min="1"
+                  step="1"
+                  required
+                  value={form.amount}
+                  onChange={(event) => setForm((current) => ({ ...current, amount: event.target.value }))}
+                />
+              </Field>
+              <Field label="تاریخ پرداخت اصلاح‌شده" required>
+                <input
+                  className={inputClass}
+                  type="date"
+                  required
+                  value={form.paymentDate}
+                  onChange={(event) => setForm((current) => ({ ...current, paymentDate: event.target.value }))}
+                />
+              </Field>
+            </div>
+
+            <div className="flex items-start gap-3 rounded-2xl border border-brand-200 bg-brand-50 p-4 text-sm text-brand-800">
+              <InfoIcon className="mt-0.5 size-4 shrink-0" />
+              <p className="leading-6">
+                دوره‌های تخصیص از پرداخت اصلی حفظ می‌شوند و با مبلغ جدید دوباره محاسبه خواهند شد.
+                علت اصلاح و کاربر انجام‌دهنده نیز در سابقه پرداخت ثبت می‌شود.
+              </p>
+            </div>
+
+            {error && <p className="text-sm text-rose-700" role="alert">{error}</p>}
+
+            <div className="flex flex-wrap items-center gap-3 border-t border-slate-100 pt-5">
+              <Button type="submit" loading={submitting} icon={<CheckIcon className="size-4" />}>
+                ثبت اصلاح
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => setForm({ reason: '', amount: payment.amount, paymentDate: payment.payment_date })}
+              >
+                بازگردانی مقادیر
+              </Button>
+            </div>
+          </form>
+        )}
       </section>
+    </div>
+  )
+}
+
+function ChangePreview({
+  label,
+  before,
+  after,
+  changed,
+}: {
+  label: string
+  before: string
+  after: string
+  changed: boolean
+}) {
+  return (
+    <div
+      className={cn(
+        'rounded-2xl border p-4 transition-colors duration-200',
+        changed ? 'border-brand-200 bg-brand-50/60' : 'border-slate-200 bg-slate-50/60',
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs font-medium text-slate-500">{label}</p>
+        {changed && (
+          <span className="rounded-full bg-brand-600/10 px-2 py-0.5 text-[11px] font-semibold text-brand-700">
+            تغییر یافته
+          </span>
+        )}
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
+        <span className={cn('text-slate-500', changed && 'line-through decoration-slate-400')}>
+          {before}
+        </span>
+        <ArrowRightIcon className="size-4 shrink-0 rotate-180 text-slate-400" />
+        <span className={cn('font-semibold', changed ? 'text-brand-700' : 'text-slate-800')}>
+          {after}
+        </span>
+      </div>
     </div>
   )
 }

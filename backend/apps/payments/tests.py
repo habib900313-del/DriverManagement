@@ -11,12 +11,20 @@ from decimal import Decimal
 from unittest import mock
 
 from django.contrib.auth.models import User
-from django.db import connection, connections, transaction
-from django.test import TestCase, TransactionTestCase
+from django.db import (
+    close_old_connections,
+    connection,
+    connections,
+    models,
+    transaction,
+)
+from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 from django.utils import timezone
+from jdatetime import date as JalaliDate
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
+from apps.core.models import ActivityLog
 from apps.drivers.models import Driver, DriverFeeHistory
 
 from . import services
@@ -31,12 +39,15 @@ from .models import (
     OnlinePaymentStatus,
     Payment,
     PaymentAllocation,
+    PaymentRefund,
     PaymentStatus,
 )
 from .periods import (
     add_calendar_months,
+    add_jalali_months,
     compute_effective_anchor,
     fee_for_period,
+    period_for_start,
     reconstruct_periods,
 )
 from .reporting import (
@@ -73,7 +84,12 @@ class FinancialTestBase(TestCase):
         self.P3 = (date(2026, 7, 1), date(2026, 9, 30))
         self.P4 = (date(2026, 10, 1), date(2026, 12, 31))
 
-    def make_driver(self, anchor, fee_start=None):
+    def make_driver(
+        self,
+        anchor,
+        fee_start=None,
+        period_calendar=Driver.PERIOD_CALENDAR_GREGORIAN,
+    ):
         self._counter += 1
         driver = Driver.objects.create(
             driver_code=f"D{self._counter}",
@@ -85,6 +101,7 @@ class FinancialTestBase(TestCase):
             address="کابل",
             registration_date=anchor,
             fee_start_date=fee_start or anchor,
+            period_calendar=period_calendar,
         )
         DriverFeeHistory.objects.create(
             driver=driver,
@@ -107,6 +124,25 @@ class FinancialTestBase(TestCase):
             user=self.user,
             target_period=period,
         )
+
+    def legacy_credit(self, amount, driver=None, payment_date=FIXED_TODAY):
+        """Create a pre-change credit allocation for historical compatibility tests."""
+        driver = driver or self.driver
+        payment = Payment.objects.create(
+            driver=driver,
+            amount=D(amount),
+            payment_date=payment_date,
+            effective_date=payment_date,
+            created_by=self.user,
+        )
+        PaymentAllocation.objects.create(
+            payment=payment,
+            allocation_type=AllocationType.CREDIT,
+            allocated_amount=D(amount),
+            effective_date=payment_date,
+            allocated_by=self.user,
+        )
+        return payment
 
     def transfer(self, amount, source, dest, driver=None):
         return services.create_transfer(
@@ -150,6 +186,42 @@ class PeriodMathTests(FinancialTestBase):
         self.assertEqual(effective, date(2027, 1, 1))
         effective2 = compute_effective_anchor(self.driver, date(2026, 8, 1))
         self.assertEqual(effective2, date(2027, 1, 1))
+
+
+class JalaliPeriodMathTests(FinancialTestBase):
+    def test_jalali_month_addition_clamps_and_converts_real_dates(self):
+        cases = [
+            ((1404, 7, 30), (1404, 10, 30)),
+            ((1404, 6, 31), (1404, 9, 30)),
+            ((1404, 9, 30), (1404, 12, 29)),
+            ((1404, 12, 29), (1405, 3, 29)),
+            ((1403, 12, 30), (1404, 3, 30)),
+        ]
+        for start_parts, next_parts in cases:
+            with self.subTest(start=start_parts):
+                start = JalaliDate(*start_parts).togregorian()
+                expected = JalaliDate(*next_parts).togregorian()
+                self.assertEqual(add_jalali_months(start, 3), expected)
+
+    def test_jalali_quarter_ends_the_day_before_the_next_start(self):
+        start = JalaliDate(1404, 8, 24).togregorian()
+        next_start = JalaliDate(1404, 11, 24).togregorian()
+        driver = self.make_driver(
+            start,
+            period_calendar=Driver.PERIOD_CALENDAR_JALALI,
+        )
+        self.assertEqual(
+            period_for_start(driver, start),
+            (start, next_start - timedelta(days=1)),
+        )
+
+    def test_legacy_driver_quarters_keep_gregorian_boundaries(self):
+        start = date(2026, 1, 31)
+        driver = self.make_driver(start)
+        self.assertEqual(
+            period_for_start(driver, start),
+            (start, date(2026, 4, 29)),
+        )
 
 
 class OwnFirstStackTests(FinancialTestBase):
@@ -227,7 +299,7 @@ class OwnFirstStackTests(FinancialTestBase):
         self.transfer(200, self.P1, self.P2)
         self.receive(250, self.P2)  # cash
         # credit 150: receive 150 unallocated then consume into P2
-        p = self.receive(150)  # all credit
+        p = self.legacy_credit(150)
         credit_alloc = p.allocations.get(allocation_type=AllocationType.CREDIT)
         services.consume_credit(
             source_allocation=credit_alloc,
@@ -257,29 +329,25 @@ class OwnFirstStackTests(FinancialTestBase):
 
 
 class CreditAndAdjustmentTests(FinancialTestBase):
-    def test_partial_payment_becomes_credit(self):
-        payment = self.receive(700, self.P1)
+    def test_partial_payment_allocates_only_to_period(self):
+        """Partial payment on one period is booked only on that period; no credit."""
+        payment = self.receive(200, self.P1)
         fee = payment.allocations.get(allocation_type=AllocationType.FEE_PERIOD)
-        credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
-        self.assertEqual(fee.allocated_amount, D("600"))
-        self.assertEqual(credit.allocated_amount, D("100"))
-        self.assertEqual(self.state(self.P1).balance, D("0"))
-        self.assertEqual(DriverLedger(self.driver).available_credit(), D("100"))
+        self.assertEqual(fee.allocated_amount, D("200"))
+        self.assertEqual(fee.target_period_start, self.P1[0])
+        self.assertEqual(self.state(self.P1).balance, D("400"))
+        self.assertEqual(payment.allocations.count(), 1)
         self.assertConserved()
 
-    def test_consumption_cap_n2(self):
-        payment = self.receive(300)  # all credit (no target)
-        credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
-        # P2 need = 600; source available 300; request 300 ok
-        services.consume_credit(
-            source_allocation=credit, amount=D("300"), target_period=self.P2, user=self.user
-        )
-        self.assertEqual(DriverLedger(self.driver).available_credit(), D("0"))
-        self.assertEqual(self.state(self.P2).balance, D("300"))
-        self.assertConserved()
+    def test_payment_without_target_period_is_rejected(self):
+        """A payment must have a target period; no credit path remains."""
+        with self.assertRaises(FinancialError) as ctx:
+            self.receive(300)
+        self.assertEqual(ctx.exception.code, "target_period_required")
+        self.assertEqual(Payment.objects.count(), 0)
 
     def test_consumption_exceeds_source_rejected(self):
-        payment = self.receive(300)
+        payment = self.legacy_credit(300)
         credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
         with self.assertRaises(FinancialError) as ctx:
             services.consume_credit(
@@ -288,7 +356,7 @@ class CreditAndAdjustmentTests(FinancialTestBase):
         self.assertEqual(ctx.exception.code, "consumption_exceeds_balance")
 
     def test_consumption_exceeds_target_need_rejected(self):
-        payment = self.receive(1000)  # 1000 credit
+        payment = self.legacy_credit(1000)
         credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
         # P2 need 600; request 700 > min(1000,600)
         with self.assertRaises(FinancialError):
@@ -321,7 +389,29 @@ class CreditAndAdjustmentTests(FinancialTestBase):
 
 class VoidCorrectTests(FinancialTestBase):
     def test_void_cascade_n1(self):
-        payment = self.receive(700, self.P1)
+        payment = Payment.objects.create(
+            driver=self.driver,
+            amount=D("700"),
+            payment_date=FIXED_TODAY,
+            effective_date=FIXED_TODAY,
+            created_by=self.user,
+        )
+        PaymentAllocation.objects.create(
+            payment=payment,
+            allocation_type=AllocationType.FEE_PERIOD,
+            target_period_start=self.P1[0],
+            target_period_end=self.P1[1],
+            allocated_amount=D("600"),
+            effective_date=FIXED_TODAY,
+            allocated_by=self.user,
+        )
+        PaymentAllocation.objects.create(
+            payment=payment,
+            allocation_type=AllocationType.CREDIT,
+            allocated_amount=D("100"),
+            effective_date=FIXED_TODAY,
+            allocated_by=self.user,
+        )
         credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
         services.consume_credit(
             source_allocation=credit, amount=D("100"), target_period=self.P2, user=self.user
@@ -336,7 +426,7 @@ class VoidCorrectTests(FinancialTestBase):
         self.assertEqual(DriverLedger(self.driver).available_credit(), D("0"))
         self.assertEqual(DriverLedger(self.driver).cash_received(), D("0"))
         self.assertConserved()
-        # all children reversed with the same timestamp
+        # All children are reversed with the same timestamp.
         stamps = {payment.voided_at}
         for alloc in payment.allocations.all():
             stamps.add(alloc.reversed_at)
@@ -344,21 +434,242 @@ class VoidCorrectTests(FinancialTestBase):
                 stamps.add(cons.reversed_at)
         self.assertEqual(len(stamps), 1)
 
+
     def test_correction_replaces_not_duplicates_r2(self):
         original = self.receive(400, self.P1)
         replacement = services.correct_payment(
-            payment=original, user=self.user, reason="اصلاح مبلغ", new_amount=D("800"),
+            payment=original, user=self.user, reason="اصلاح مبلغ", new_amount=D("500"),
             target_period=self.P1,
         )
         original.refresh_from_db()
         self.assertEqual(original.status, PaymentStatus.CORRECTED)
         self.assertEqual(replacement.correction_of_id, original.id)
         self.assertEqual(replacement.effective_date, FIXED_TODAY)
-        self.assertEqual(DriverLedger(self.driver).cash_received(), D("800"))
-        self.assertEqual(self.state(self.P1).balance, D("0"))
-        # credit 200 from the 800 correction
-        self.assertEqual(DriverLedger(self.driver).available_credit(), D("200"))
+        self.assertEqual(DriverLedger(self.driver).cash_received(), D("500"))
+        self.assertEqual(self.state(self.P1).balance, D("100"))
+        self.assertEqual(DriverLedger(self.driver).available_credit(), D("0"))
         self.assertConserved()
+
+    def test_payment_correction_reuses_original_period_and_records_audit(self):
+        original_date = date(2026, 1, 10)
+        corrected_date = date(2026, 1, 12)
+        original = self.receive(400, self.P1, payment_date=original_date)
+        replacement = services.correct_payment(
+            payment=original,
+            user=self.user,
+            reason="اصلاح مبلغ و تاریخ",
+            new_amount=D("500"),
+            new_payment_date=corrected_date,
+        )
+
+        original.refresh_from_db()
+        self.assertEqual(original.status, PaymentStatus.CORRECTED)
+        self.assertEqual(original.payment_date, original_date)
+        self.assertEqual(original.corrected_by, self.user)
+        self.assertEqual(original.correction_reason, "اصلاح مبلغ و تاریخ")
+        self.assertEqual(original.allocations.get().reversed_by, self.user)
+        self.assertEqual(original.allocations.get().reversal_reason, "اصلاح مبلغ و تاریخ")
+        self.assertEqual(replacement.correction_of, original)
+        self.assertEqual(replacement.amount, D("500"))
+        self.assertEqual(replacement.payment_date, corrected_date)
+        replacement_allocation = replacement.allocations.get()
+        self.assertEqual(
+            (
+                replacement_allocation.target_period_start,
+                replacement_allocation.target_period_end,
+            ),
+            self.P1,
+        )
+        self.assertEqual(DriverLedger(self.driver).cash_received(), D("500"))
+        self.assertConserved()
+
+    def test_payment_correction_recalculates_all_original_period_allocations(self):
+        original = services.receive_payment(
+            driver=self.driver,
+            amount=D("900"),
+            payment_date=FIXED_TODAY,
+            user=self.user,
+            target_period=self.P1,
+            periods_count=2,
+        )
+        self.assertEqual(original.allocations.count(), 2)
+
+        replacement = services.correct_payment(
+            payment=original,
+            user=self.user,
+            reason="اصلاح مبلغ پرداخت چنددوره‌ای",
+            new_amount=D("1000"),
+        )
+
+        self.assertEqual(
+            list(
+                replacement.allocations.order_by("target_period_start").values_list(
+                    "target_period_start", "allocated_amount"
+                )
+            ),
+            [(self.P1[0], D("600")), (self.P2[0], D("400"))],
+        )
+        self.assertEqual(
+            original.allocations.filter(reversed_at__isnull=False).count(),
+            2,
+        )
+        self.assertEqual(DriverLedger(self.driver).cash_received(), D("1000"))
+        self.assertConserved()
+
+    def test_payment_correction_spills_increased_amount_into_next_period(self):
+        original = self.receive(600, self.P1)
+        replacement = services.correct_payment(
+            payment=original,
+            user=self.user,
+            reason="افزایش مبلغ پرداخت",
+            new_amount=D("800"),
+        )
+        self.assertEqual(
+            list(
+                replacement.allocations.order_by("target_period_start").values_list(
+                    "target_period_start", "allocated_amount"
+                )
+            ),
+            [(self.P1[0], D("600")), (self.P2[0], D("200"))],
+        )
+        self.assertEqual(
+            replacement.allocations.filter(
+                allocation_type=AllocationType.CREDIT
+            ).count(),
+            0,
+        )
+        self.assertEqual(DriverLedger(self.driver).cash_received(), D("800"))
+        self.assertConserved()
+
+    def test_partial_and_full_refunds_preserve_history_and_reopen_debt(self):
+        payment = self.receive(600, self.P1, payment_date=date(2026, 11, 9))
+        original_allocation = payment.allocations.get()
+        original_updated_at = payment.updated_at
+
+        partial = services.refund_payment(
+            payment=payment,
+            amount=D("200"),
+            refund_date=FIXED_TODAY,
+            user=self.user,
+            reason="برگشت جزئی",
+        )
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, PaymentStatus.RECEIVED)
+        self.assertEqual(payment.updated_at, original_updated_at)
+        self.assertEqual(partial.payment, payment)
+        self.assertEqual(partial.refunded_by, self.user)
+        self.assertEqual(partial.reason, "برگشت جزئی")
+        original_allocation.refresh_from_db()
+        self.assertIsNotNone(original_allocation.reversed_at)
+        replacement_allocation = payment.allocations.get(reversed_at__isnull=True)
+        self.assertEqual(replacement_allocation.allocated_amount, D("400"))
+        self.assertEqual(
+            DriverLedger(self.driver, date(2026, 11, 9)).cash_received(),
+            D("600"),
+        )
+        self.assertEqual(
+            DriverLedger(self.driver, date(2026, 11, 9))
+            .period_state(*self.P1)
+            .balance,
+            D("0"),
+        )
+        self.assertEqual(self.state(self.P1).balance, D("200"))
+        self.assertEqual(DriverLedger(self.driver).cash_received(), D("400"))
+        self.assertTrue(conservation_report(self.driver)["all_ok"])
+
+        services.refund_payment(
+            payment=payment,
+            amount=D("400"),
+            refund_date=FIXED_TODAY,
+            user=self.user,
+            reason="برگشت باقی‌مانده",
+        )
+        self.assertEqual(PaymentRefund.objects.filter(payment=payment).count(), 2)
+        self.assertEqual(payment.allocations.filter(reversed_at__isnull=True).count(), 0)
+        self.assertEqual(self.state(self.P1).balance, D("600"))
+        self.assertEqual(DriverLedger(self.driver).cash_received(), D("0"))
+        self.assertTrue(conservation_report(self.driver)["all_ok"])
+
+    def test_full_refund_recalculates_legacy_credit_and_consumption(self):
+        payment = self.legacy_credit(700)
+        credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
+        services.consume_credit(
+            source_allocation=credit,
+            amount=D("100"),
+            target_period=self.P2,
+            user=self.user,
+        )
+
+        services.refund_payment(
+            payment=payment,
+            amount=D("700"),
+            refund_date=FIXED_TODAY,
+            user=self.user,
+            reason="برگشت کامل پرداخت اعتباری",
+        )
+
+        self.assertEqual(DriverLedger(self.driver).cash_received(), D("0"))
+        self.assertEqual(DriverLedger(self.driver).available_credit(), D("0"))
+        self.assertEqual(self.state(self.P2).balance, D("600"))
+        self.assertEqual(payment.allocations.filter(reversed_at__isnull=True).count(), 0)
+        self.assertTrue(conservation_report(self.driver)["all_ok"])
+
+    def test_refund_cannot_exceed_unreturned_payment_amount(self):
+        payment = self.receive(600, self.P1)
+        with self.assertRaises(FinancialError) as ctx:
+            services.refund_payment(
+                payment=payment,
+                amount=D("601"),
+                refund_date=FIXED_TODAY,
+                user=self.user,
+                reason="بیش از مانده",
+            )
+        self.assertEqual(ctx.exception.code, "refund_exceeds_balance")
+        self.assertEqual(PaymentRefund.objects.filter(payment=payment).count(), 0)
+        self.assertEqual(payment.allocations.filter(reversed_at__isnull=True).count(), 1)
+
+    def test_refund_records_reduce_cash_reports_using_refund_date(self):
+        payment = self.receive(600, self.P1)
+        services.refund_payment(
+            payment=payment,
+            amount=D("200"),
+            refund_date=FIXED_TODAY,
+            user=self.user,
+            reason="گزارش برگشت",
+        )
+        self.assertEqual(
+            DriverLedger(self.driver).cash_received_range(FIXED_TODAY, FIXED_TODAY),
+            D("400"),
+        )
+        self.assertEqual(
+            cash_revenue_report(
+                as_of=FIXED_TODAY,
+                date_from=FIXED_TODAY,
+                date_to=FIXED_TODAY,
+            )["cash_revenue"],
+            "400.00",
+        )
+
+    def test_payment_with_refund_cannot_be_voided_or_corrected(self):
+        payment = self.receive(600, self.P1)
+        services.refund_payment(
+            payment=payment,
+            amount=D("100"),
+            refund_date=FIXED_TODAY,
+            user=self.user,
+            reason="محدودیت عملیات بعدی",
+        )
+        with self.assertRaises(FinancialError) as void_error:
+            services.void_payment(payment=payment, user=self.user, reason="ابطال")
+        self.assertEqual(void_error.exception.code, "payment_has_refunds")
+        with self.assertRaises(FinancialError) as correction_error:
+            services.correct_payment(
+                payment=payment,
+                user=self.user,
+                reason="اصلاح",
+                new_amount=D("600"),
+            )
+        self.assertEqual(correction_error.exception.code, "payment_has_refunds")
 
     def test_allocation_correction_wrong_period_w5(self):
         payment = self.receive(600, self.P1)
@@ -377,7 +688,7 @@ class VoidCorrectTests(FinancialTestBase):
     def test_w5_ext_credit_correction_with_consumptions(self):
         # P=700 credit; C1=100->P2, C2=100->P3; correct source 700->300 and
         # re-approve only C1'=100->P2 (C2 stays reversed, P3 debt restored).
-        payment = self.receive(700)  # all credit
+        payment = self.legacy_credit(700)
         credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
         services.consume_credit(
             source_allocation=credit, amount=D("100"), target_period=self.P2, user=self.user
@@ -409,6 +720,14 @@ class W9ChainTests(FinancialTestBase):
     def test_n4_unsettle_then_reverse(self):
         t = self.transfer(300, self.P1, self.P2)
         payment = self.receive(900, self.P2)  # settles P2 fully (own 600 + T 300)
+        self.assertEqual(payment.allocations.count(), 1)
+        self.assertEqual(
+            payment.allocations.get().allocation_type, AllocationType.FEE_PERIOD
+        )
+        self.assertEqual(payment.allocations.get().allocated_amount, D("900"))
+        self.assertEqual(
+            payment.allocations.filter(allocation_type=AllocationType.CREDIT).count(), 0
+        )
         self.assertEqual(self.state(self.P2).balance, D("0"))
         self.assertEqual(self.state(self.P2).transfers[0].remaining, D("0"))
         with self.assertRaises(FinancialError):
@@ -522,7 +841,7 @@ class TriggerTests(FinancialTestBase):
         self.assertEqual(payment.allocations.count(), 1)
 
     def test_consumption_source_trigger_raw_v5(self):
-        payment = self.receive(300)
+        payment = self.legacy_credit(300)
         credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
         with self.assertRaises(Exception):
             self._raw_execute_rejected(
@@ -687,56 +1006,18 @@ class TargetPeriodValidationTests(FinancialTestBase):
         self.assertEqual(ctx.exception.code, "unknown_period")
 
     # ------------------------------------------------------------------
-    # C6 — future prepayment goes through the credit path
+    # C6 — a payment without a target period is rejected (no credit path)
     # ------------------------------------------------------------------
-    def test_prepayment_without_target_uses_credit_path(self):
-        """No target period => the whole amount becomes traceable credit."""
-        payment = self.receive(600)
-        alloc = payment.allocations.get(allocation_type=AllocationType.CREDIT)
-        self.assertEqual(alloc.allocated_amount, D("600"))
-        self.assertIsNone(alloc.target_period_start)
-        self.assertIsNone(alloc.target_period_end)
-        self.assertEqual(payment.allocations.count(), 1)
-        # The prepayment is money in the pool, not a settled future period:
-        # the driver's own obligation for the started period is untouched.
-        self.assertEqual(self.state(self.P1).balance, D("600"))
-        self.assertEqual(DriverLedger(self.driver).source_available(alloc), D("600"))
-
-    def test_prepayment_credit_can_later_settle_a_started_period(self):
-        """Credit raised for a prepayment can be consumed against a started period."""
-        payment = self.receive(600)  # prepayment -> credit 600
-        credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
-        services.consume_credit(
-            source_allocation=credit, amount=D("100"), target_period=self.P1,
-            user=self.user,
-        )
-        self.assertEqual(AllocationConsumption.objects.count(), 1)
-        self.assertEqual(DriverLedger(self.driver).source_available(credit), D("500"))
-
-    # ------------------------------------------------------------------
-    # Consumption targets
-    # ------------------------------------------------------------------
-    def test_consumption_future_target_is_rejected(self):
-        payment = self.receive(300)
-        credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
+    def test_prepayment_without_target_is_rejected(self):
+        """No target period => payment is rejected; nothing is written to ledger."""
         with self.assertRaises(FinancialError) as ctx:
-            services.consume_credit(
-                source_allocation=credit, amount=D("100"),
-                target_period=self.FUTURE, user=self.user,
-            )
-        self.assertEqual(ctx.exception.code, "future_period")
-        self.assertEqual(AllocationConsumption.objects.count(), 0)
+            self.receive(600)
+        self.assertEqual(ctx.exception.code, "target_period_required")
+        self.assertEqual(Payment.objects.count(), 0)
 
-    def test_consumption_unknown_target_is_rejected(self):
-        payment = self.receive(300)
-        credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
-        with self.assertRaises(FinancialError) as ctx:
-            services.consume_credit(
-                source_allocation=credit, amount=D("100"),
-                target_period=self.NOT_A_PERIOD, user=self.user,
-            )
-        self.assertEqual(ctx.exception.code, "unknown_period")
-        self.assertEqual(AllocationConsumption.objects.count(), 0)
+    # ------------------------------------------------------------------
+    # Historical credit consumption remains supported; see compatibility tests above.
+    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Correction targets (W5)
@@ -794,12 +1075,11 @@ class TargetPeriodValidationTests(FinancialTestBase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(Payment.objects.count(), 1)
 
-    def test_api_prepayment_without_target_creates_credit(self):
+    def test_api_payment_without_target_is_rejected(self):
         response = self._api_payment()
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        payment = Payment.objects.get(pk=response.data["id"])
-        alloc = payment.allocations.get(allocation_type=AllocationType.CREDIT)
-        self.assertEqual(alloc.allocated_amount, D("600"))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["code"], "target_period_required")
+        self.assertEqual(Payment.objects.count(), 0)
 
 
 class FinancialReportTests(FinancialTestBase):
@@ -835,12 +1115,72 @@ class FinancialReportTests(FinancialTestBase):
         self.assertEqual(report["debt"]["total_balance"], "2400.00")
         self.assertEqual(report["totals"]["driver_count"], 1)
 
+    def test_archive_filter_scopes_every_aggregate_without_changing_history(self):
+        archived = self.make_driver(date(2026, 1, 1))
+        archived.is_deleted = True
+        archived.deleted_at = FIXED_NOW
+        archived.save(update_fields=["is_deleted", "deleted_at"])
+
+        inactive = self.make_driver(date(2026, 1, 1))
+
+        self.receive(600, self.P1, driver=self.driver)
+        self.receive(300, self.P1, driver=archived)
+        self.receive(150, self.P1, driver=inactive)
+        inactive.status = False
+        inactive.save(update_fields=["status"])
+        payment_count = Payment.objects.count()
+        allocation_count = PaymentAllocation.objects.count()
+
+        active_report = financial_report(as_of=FIXED_TODAY)
+        self.assertEqual(
+            [row["driver_id"] for row in active_report["drivers"]],
+            [self.driver.id],
+        )
+        self.assertEqual(active_report["archive_status"], "active")
+        self.assertEqual(active_report["payments"]["count"], 1)
+        self.assertEqual(active_report["payments"]["total_amount"], "600.00")
+        self.assertEqual(active_report["revenue"]["cash_revenue"], "600.00")
+        self.assertEqual(active_report["debt"]["total_balance"], "1800.00")
+        self.assertEqual(active_report["debt"]["fee_in_range"], "2400.00")
+        self.assertEqual(active_report["credit"]["available_total"], "0.00")
+        self.assertEqual(active_report["totals"]["driver_count"], 1)
+
+        archived_report = financial_report(
+            as_of=FIXED_TODAY,
+            archive_status="archived",
+        )
+        self.assertEqual(
+            [row["driver_id"] for row in archived_report["drivers"]],
+            [archived.id],
+        )
+        self.assertEqual(archived_report["payments"]["count"], 1)
+        self.assertEqual(archived_report["payments"]["total_amount"], "300.00")
+        self.assertEqual(archived_report["revenue"]["cash_revenue"], "300.00")
+        self.assertEqual(archived_report["debt"]["total_balance"], "2100.00")
+        self.assertEqual(archived_report["totals"]["driver_count"], 1)
+
+        all_report = financial_report(as_of=FIXED_TODAY, archive_status="all")
+        self.assertEqual(
+            [row["driver_id"] for row in all_report["drivers"]],
+            [self.driver.id, archived.id, inactive.id],
+        )
+        self.assertEqual(all_report["payments"]["count"], 3)
+        self.assertEqual(all_report["payments"]["total_amount"], "1050.00")
+        self.assertEqual(all_report["revenue"]["cash_revenue"], "1050.00")
+        self.assertEqual(all_report["debt"]["total_balance"], "6150.00")
+        self.assertEqual(all_report["totals"]["driver_count"], 3)
+
+        self.assertEqual(Payment.objects.count(), payment_count)
+        self.assertEqual(PaymentAllocation.objects.count(), allocation_count)
+        archived.refresh_from_db()
+        self.assertTrue(archived.is_deleted)
+
     # ------------------------------------------------------------------
     # Range scoping
     # ------------------------------------------------------------------
     def test_range_scopes_payments_and_revenue(self):
         self.receive(600, self.P1)          # payment_date = FIXED_TODAY
-        self.receive(300, self.P1, payment_date=date(2026, 2, 1))
+        self.receive(300, self.P2, payment_date=date(2026, 2, 1))
 
         full = financial_report(as_of=FIXED_TODAY)
         self.assertEqual(full["payments"]["count"], 2)
@@ -858,7 +1198,7 @@ class FinancialReportTests(FinancialTestBase):
 
     def test_range_excludes_payments_outside_it(self):
         self.receive(600, self.P1)
-        self.receive(300, self.P1, payment_date=date(2026, 2, 1))
+        self.receive(300, self.P2, payment_date=date(2026, 2, 1))
         ranged = financial_report(
             date_from=date(2026, 1, 1), date_to=date(2026, 2, 28), as_of=FIXED_TODAY
         )
@@ -882,7 +1222,7 @@ class FinancialReportTests(FinancialTestBase):
         self.assertEqual(report["credit"]["available_total"], "0.00")
 
     def test_credit_is_reported_after_a_prepayment(self):
-        payment = self.receive(600)  # no target period -> credit allocation
+        payment = self.legacy_credit(600)
         report = financial_report(as_of=FIXED_TODAY)
         driver_row = next(r for r in report["drivers"] if r["driver_id"] == self.driver.id)
         self.assertEqual(driver_row["available_credit"], "600.00")
@@ -895,7 +1235,7 @@ class FinancialReportTests(FinancialTestBase):
 
     def test_totals_equal_the_sum_of_driver_rows(self):
         self.receive(600, self.P1)
-        self.receive(300, self.P1)
+        self.receive(300, self.P2)
         report = financial_report(as_of=FIXED_TODAY)
         self.assertEqual(
             report["debt"]["total_balance"],
@@ -932,6 +1272,28 @@ class FinancialReportTests(FinancialTestBase):
         self.assertEqual(response.data["payments"]["count"], 1)
         self.assertEqual(response.data["payments"]["total_amount"], "600.00")
         self.assertEqual(len(response.data["drivers"]), 1)
+        self.assertEqual(response.data["archive_status"], "active")
+
+    def test_api_archive_filter_scopes_driver_rows_and_totals(self):
+        archived = self.make_driver(date(2026, 1, 1))
+        archived.is_deleted = True
+        archived.deleted_at = FIXED_NOW
+        archived.save(update_fields=["is_deleted", "deleted_at"])
+        self.receive(600, self.P1, driver=self.driver)
+        self.receive(300, self.P1, driver=archived)
+
+        response = self._api_report(archive_status="archived")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["archive_status"], "archived")
+        self.assertEqual([row["driver_id"] for row in response.data["drivers"]], [archived.id])
+        self.assertEqual(response.data["payments"]["total_amount"], "300.00")
+        self.assertEqual(response.data["revenue"]["cash_revenue"], "300.00")
+
+    def test_api_rejects_unknown_archive_filter(self):
+        response = self._api_report(archive_status="unknown")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["code"], "invalid_archive_status")
 
     def test_api_requires_both_range_bounds(self):
         response = self._api_report(date_from="2026-01-01")
@@ -1000,7 +1362,7 @@ class MultiPeriodAllocationTests(FinancialTestBase):
         """800 covers 600 of P1 and 200 of P2."""
         services.receive_payment(
             driver=self.driver, amount=D("800"), payment_date=FIXED_TODAY,
-            user=self.user, target_period=self.P1, periods_count=2,
+            user=self.user, target_period=self.P1,
         )
         payment = Payment.objects.filter(driver=self.driver).order_by("-id").first()
         allocs = self._fee_allocs(payment)
@@ -1026,19 +1388,105 @@ class MultiPeriodAllocationTests(FinancialTestBase):
         )
         self.assertEqual([a.allocated_amount for a in allocs], [D("600"), D("600"), D("600")])
 
-    def test_remainder_beyond_the_covered_periods_goes_to_credit(self):
-        """2000 for two quarters: 1200 on the quarters, 800 stays as credit."""
-        services.receive_payment(
-            driver=self.driver, amount=D("2000"), payment_date=FIXED_TODAY,
-            user=self.user, target_period=self.P1, periods_count=2,
+    def test_payment_spills_over_beyond_selected_period_count(self):
+        """1500 is automatically assigned across three consecutive periods."""
+        payment = services.receive_payment(
+            driver=self.driver, amount=D("1500"), payment_date=FIXED_TODAY,
+            user=self.user, target_period=self.P1,
         )
-        payment = Payment.objects.filter(driver=self.driver).order_by("-id").first()
         allocs = self._fee_allocs(payment)
-        self.assertEqual(sum(a.allocated_amount for a in allocs), D("1200"))
-        credit = self._credit_alloc(payment)
-        self.assertIsNotNone(credit)
-        self.assertEqual(credit.allocated_amount, D("800"))
-        self.assertIsNone(credit.target_period_start)
+        self.assertEqual(
+            [(item.target_period_start, item.allocated_amount) for item in allocs],
+            [(self.P1[0], D("600")), (self.P2[0], D("600")), (self.P3[0], D("300"))],
+        )
+        self.assertEqual(
+            sum((item.allocated_amount for item in allocs), D("0")),
+            payment.amount,
+        )
+        self.assertIsNone(self._credit_alloc(payment))
+
+    def test_payment_of_two_period_fees_spills_over_automatically(self):
+        payment = self.receive(1200, self.P1)
+        allocs = self._fee_allocs(payment)
+        self.assertEqual(
+            [(item.target_period_start, item.allocated_amount) for item in allocs],
+            [(self.P1[0], D("600")), (self.P2[0], D("600"))],
+        )
+        self.assertEqual(self.state(self.P1).balance, D("0"))
+        self.assertEqual(self.state(self.P2).balance, D("0"))
+        self.assertConserved()
+
+    def test_paid_period_is_skipped_when_spilling_over(self):
+        self.receive(600, self.P1)
+        payment = self.receive(800, self.P1)
+        allocs = self._fee_allocs(payment)
+        self.assertEqual(
+            [(item.target_period_start, item.allocated_amount) for item in allocs],
+            [(self.P2[0], D("600")), (self.P3[0], D("200"))],
+        )
+        self.assertEqual(self.state(self.P1).balance, D("0"))
+        self.assertEqual(self.state(self.P2).balance, D("0"))
+        self.assertEqual(self.state(self.P3).balance, D("400"))
+        self.assertConserved()
+
+    def test_transfer_balance_is_paid_before_spilling_to_next_period(self):
+        self.transfer(300, self.P1, self.P2)
+        payment = self.receive(800, self.P1)
+        allocs = self._fee_allocs(payment)
+        self.assertEqual(
+            [(item.target_period_start, item.allocated_amount) for item in allocs],
+            [(self.P1[0], D("300")), (self.P2[0], D("500"))],
+        )
+        self.assertEqual(self.state(self.P1).balance, D("0"))
+        self.assertEqual(self.state(self.P2).balance, D("400"))
+        self.assertConserved()
+
+    def test_idempotent_multiperiod_payment_does_not_duplicate_allocations(self):
+        kwargs = dict(
+            driver=self.driver,
+            amount=D("800"),
+            payment_date=FIXED_TODAY,
+            user=self.user,
+            target_period=self.P1,
+            idempotency_key="auto-spillover-once",
+        )
+        first = services.receive_payment(**kwargs)
+        repeated = services.receive_payment(**kwargs)
+        self.assertEqual(repeated.id, first.id)
+        self.assertEqual(first.allocations.count(), 2)
+        self.assertEqual(
+            sum(
+                (item.allocated_amount for item in first.allocations.all()),
+                D("0"),
+            ),
+            first.amount,
+        )
+
+    def test_refund_rebuilds_multiperiod_allocations_without_losing_history(self):
+        payment = self.receive(800, self.P1)
+        original_allocations = list(self._fee_allocs(payment))
+        services.refund_payment(
+            payment=payment,
+            amount=D("200"),
+            refund_date=FIXED_TODAY,
+            user=self.user,
+            reason="برگشت بخشی از پرداخت چنددوره‌ای",
+        )
+        for allocation in original_allocations:
+            allocation.refresh_from_db()
+            self.assertIsNotNone(allocation.reversed_at)
+        active = list(
+            payment.allocations.filter(reversed_at__isnull=True).order_by(
+                "target_period_start"
+            )
+        )
+        self.assertEqual(
+            [(item.target_period_start, item.allocated_amount) for item in active],
+            [(self.P1[0], D("600"))],
+        )
+        self.assertEqual(self.state(self.P1).balance, D("0"))
+        self.assertEqual(self.state(self.P2).balance, D("600"))
+        self.assertConserved()
 
     def test_allocations_never_exceed_the_payment_amount(self):
         services.receive_payment(
@@ -1164,14 +1612,58 @@ class PeriodCoverageTests(FinancialTestBase):
         self.assertGreater(len(starts), 4)
         self.assertTrue(any(r["is_future"] for r in coverage["periods"]))
 
+    def test_future_preview_does_not_increase_debt(self):
+        coverage = self._coverage()
+        future_rows = [row for row in coverage["periods"] if row["is_future"]]
+        self.assertEqual(len(future_rows), 4)
+
+        summary = driver_financial_summary(self.driver, as_of=FIXED_TODAY)
+        self.assertEqual(summary["current_obligation"], "600.00")
+        self.assertEqual(summary["overdue_debt"], "1800.00")
+        self.assertEqual(summary["driver_total_balance"], "2400.00")
+
     def test_unpaid_quarter_is_neutral(self):
         coverage = self._coverage()
         row = self._row(coverage, self.P1[0])
         self.assertEqual(row["status"], "unpaid")
         self.assertEqual(row["paid"], "0.00")
+
+    def test_coverage_exposes_each_payment_assigned_to_the_same_period(self):
+        first = self.receive(200, self.P1)
+        second = self.receive(300, self.P1)
+
+        row = self._row(self._coverage(), self.P1[0])
+
+        self.assertEqual(
+            {allocation["payment_id"] for allocation in row["allocations"]},
+            {first.id, second.id},
+        )
+        self.assertEqual(
+            {allocation["amount"] for allocation in row["allocations"]},
+            {"200.00", "300.00"},
+        )
         self.assertEqual(row["total"], "600.00")
-        self.assertEqual(row["remaining"], "600.00")
-        self.assertEqual(row["percent"], 0)
+        self.assertEqual(row["paid"], "500.00")
+        self.assertEqual(row["remaining"], "100.00")
+        self.assertEqual(row["percent"], 83)
+        self.assertEqual(row["status"], "partial")
+
+    def test_coverage_shows_automatic_allocation_on_each_period(self):
+        payment = self.receive(800, self.P1)
+        coverage = self._coverage()
+        first = self._row(coverage, self.P1[0])
+        second = self._row(coverage, self.P2[0])
+
+        self.assertEqual(
+            [(allocation["payment_id"], allocation["amount"]) for allocation in first["allocations"]],
+            [(payment.id, "600.00")],
+        )
+        self.assertEqual(
+            [(allocation["payment_id"], allocation["amount"]) for allocation in second["allocations"]],
+            [(payment.id, "200.00")],
+        )
+        self.assertEqual(first["remaining"], "0.00")
+        self.assertEqual(second["remaining"], "400.00")
 
     def test_fully_paid_quarter_is_paid(self):
         self.receive(600, self.P1)
@@ -1203,7 +1695,7 @@ class PeriodCoverageTests(FinancialTestBase):
         self.assertIsNone(detail["reversed_at"])
 
     def test_quarter_shows_the_credit_consumed_on_it(self):
-        payment = self.receive(600)  # credit only
+        payment = self.legacy_credit(600)
         credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
         services.consume_credit(
             source_allocation=credit, amount=D("100"), target_period=self.P1,
@@ -1240,19 +1732,19 @@ class AsOfTests(FinancialTestBase):
         Payment.objects.filter(pk=payment.pk).update(voided_at=when)
 
     def test_revenue_as_of_void_n6_r1(self):
-        payment = self.receive(800, self.P1, payment_date=date(2026, 2, 20))
+        payment = self.receive(600, self.P1, payment_date=date(2026, 2, 20))
         # void on 2026-03-16
         void_time = datetime(2026, 3, 16, 8, 0, tzinfo=dt_timezone.utc)
         services.void_payment(payment=payment, user=self.user, reason="ابطال")
         self._set_voided_at(payment, void_time)
-        self.assertEqual(DriverLedger(self.driver, date(2026, 2, 28)).cash_received(), D("800"))
+        self.assertEqual(DriverLedger(self.driver, date(2026, 2, 28)).cash_received(), D("600"))
         self.assertEqual(DriverLedger(self.driver, date(2026, 3, 16)).cash_received(), D("0"))
         self.assertEqual(DriverLedger(self.driver, FIXED_TODAY).cash_received(), D("0"))
 
     def test_correction_as_of_r2(self):
         original = self.receive(400, self.P1, payment_date=date(2026, 2, 20))
         replacement = services.correct_payment(
-            payment=original, user=self.user, reason="اصلاح", new_amount=D("800"), target_period=self.P1
+            payment=original, user=self.user, reason="اصلاح", new_amount=D("500"), target_period=self.P1
         )
         corrected_time = datetime(2026, 3, 10, 8, 0, tzinfo=dt_timezone.utc)
         Payment.objects.filter(pk=original.pk).update(corrected_at=corrected_time)
@@ -1260,17 +1752,17 @@ class AsOfTests(FinancialTestBase):
             effective_date=date(2026, 3, 10), created_at=corrected_time
         )
         self.assertEqual(DriverLedger(self.driver, date(2026, 2, 28)).cash_received(), D("400"))
-        self.assertEqual(DriverLedger(self.driver, date(2026, 3, 15)).cash_received(), D("800"))
-        self.assertEqual(DriverLedger(self.driver, FIXED_TODAY).cash_received(), D("800"))
+        self.assertEqual(DriverLedger(self.driver, date(2026, 3, 15)).cash_received(), D("500"))
+        self.assertEqual(DriverLedger(self.driver, FIXED_TODAY).cash_received(), D("500"))
         # no as-of date ever sees 1200
         for d in [date(2026, 2, 28), date(2026, 3, 10), date(2026, 3, 15), FIXED_TODAY]:
             self.assertNotEqual(DriverLedger(self.driver, d).cash_received(), D("1200"))
 
     def test_late_registration_economic_vs_audit_r3(self):
         # cash genuinely received 2026-01-18 but recorded today
-        self.receive(700, self.P1, payment_date=date(2026, 1, 18))
+        self.receive(600, self.P1, payment_date=date(2026, 1, 18))
         ledger_econ = DriverLedger(self.driver, date(2026, 1, 18))
-        self.assertEqual(ledger_econ.cash_received(), D("700"))  # F2 economic
+        self.assertEqual(ledger_econ.cash_received(), D("600"))  # F2 economic
         self.assertEqual(ledger_econ.cash_recorded(), D("0"))  # F5b audit (created today)
 
     def test_adjustment_partial_as_of_n7(self):
@@ -1302,21 +1794,215 @@ class APITests(FinancialTestBase):
         response = anon.get("/api/payments/")
         self.assertIn(response.status_code, (401, 403))
 
-    def test_receive_payment_api(self):
-        response = self.client.post(
+    def test_admin_can_register_payment_and_create_adjustment(self):
+        admin = User.objects.create_user(
+            username="financial-admin", password="pass123", is_staff=True
+        )
+        self.client.force_authenticate(user=admin)
+        self.assertEqual(self.client.get("/api/reports/financial/").status_code, 200)
+
+        payment_response = self.client.post(
             "/api/payments/",
             {
                 "driver_id": self.driver.id,
-                "amount": "700",
+                "amount": "100",
                 "payment_date": FIXED_TODAY.isoformat(),
                 "target_period_start": self.P1[0].isoformat(),
                 "target_period_end": self.P1[1].isoformat(),
             },
             format="json",
         )
+        self.assertEqual(
+            payment_response.status_code, status.HTTP_201_CREATED, payment_response.data
+        )
+
+        adjustment_response = self.client.post(
+            "/api/adjustments/",
+            {
+                "driver_id": self.driver.id,
+                "adjustment_type": "waiver",
+                "amount": "50",
+                "source_period_start": self.P1[0].isoformat(),
+                "source_period_end": self.P1[1].isoformat(),
+                "reason": "Admin permission test",
+            },
+            format="json",
+        )
+        self.assertEqual(
+            adjustment_response.status_code,
+            status.HTTP_201_CREATED,
+            adjustment_response.data,
+        )
+
+    def test_admin_can_correct_payment(self):
+        admin = User.objects.create_user(
+            username="payment-correction-admin", password="pass123", is_staff=True
+        )
+        payment = self.receive(600, self.P1)
+        self.client.force_authenticate(user=admin)
+
+        response = self.client.post(
+            f"/api/payments/{payment.id}/correct/",
+            {
+                "reason": "Admin correction permission test",
+                "target_period_start": self.P1[0].isoformat(),
+                "target_period_end": self.P1[1].isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(Payment.objects.get(pk=payment.id).status, "corrected")
+
+    def test_admin_can_partially_refund_payment_and_read_audit(self):
+        admin = User.objects.create_user(
+            username="payment-refund-admin", password="pass123", is_staff=True
+        )
+        payment = self.receive(600, self.P1)
+        self.client.force_authenticate(user=admin)
+
+        response = self.client.post(
+            f"/api/payments/{payment.id}/refund/",
+            {
+                "amount": "200",
+                "refund_date": FIXED_TODAY.isoformat(),
+                "reason": "Refund API test",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["amount"], "200.00")
+        self.assertEqual(response.data["refunded_by"], admin.id)
+        self.assertEqual(response.data["refunded_by_name"], admin.username)
+
+        detail = self.client.get(f"/api/payments/{payment.id}/")
+        self.assertEqual(detail.status_code, status.HTTP_200_OK)
+        self.assertEqual(detail.data["refunded_total"], D("200.00"))
+        self.assertEqual(detail.data["refundable_amount"], D("400.00"))
+        self.assertEqual(len(detail.data["refunds"]), 1)
+
+    def test_guest_can_read_financial_data_but_cannot_write(self):
+        payment = self.receive(100, self.P1)
+        guest = User.objects.create_user(username="financial-guest", password="pass")
+        self.client.force_authenticate(user=guest)
+
+        self.assertEqual(self.client.get("/api/payments/").status_code, 200)
+        self.assertEqual(self.client.get("/api/adjustments/").status_code, 200)
+        self.assertEqual(self.client.get("/api/reports/financial/").status_code, 200)
+
+        write_responses = (
+            self.client.post(
+                "/api/payments/",
+                {
+                    "driver_id": self.driver.id,
+                    "amount": "100",
+                    "payment_date": FIXED_TODAY.isoformat(),
+                    "target_period_start": self.P1[0].isoformat(),
+                    "target_period_end": self.P1[1].isoformat(),
+                },
+                format="json",
+            ),
+            self.client.post(
+                "/api/adjustments/",
+                {
+                    "driver_id": self.driver.id,
+                    "adjustment_type": "waiver",
+                    "amount": "50",
+                    "source_period_start": self.P1[0].isoformat(),
+                    "source_period_end": self.P1[1].isoformat(),
+                    "reason": "Guest write test",
+                },
+                format="json",
+            ),
+            self.client.post("/api/credits/consume/", {}, format="json"),
+            self.client.post(
+                f"/api/payments/{payment.id}/void/", {}, format="json"
+            ),
+            self.client.post(
+                f"/api/payments/{payment.id}/correct/", {}, format="json"
+            ),
+            self.client.post(
+                f"/api/payments/{payment.id}/refund/",
+                {
+                    "amount": "1",
+                    "refund_date": FIXED_TODAY.isoformat(),
+                    "reason": "Guest refund attempt",
+                },
+                format="json",
+            ),
+            self.client.post("/api/online-payments/", {}, format="json"),
+        )
+        self.assertTrue(
+            all(response.status_code == status.HTTP_403_FORBIDDEN for response in write_responses),
+            [response.status_code for response in write_responses],
+        )
+        self.assertEqual(Payment.objects.count(), 1)
+        self.assertEqual(Adjustment.objects.count(), 0)
+        self.assertEqual(Payment.objects.get(pk=payment.id).status, "received")
+
+    def test_receive_payment_api(self):
+        response = self.client.post(
+            "/api/payments/",
+            {
+                "driver_id": self.driver.id,
+                "amount": "600",
+                "payment_date": FIXED_TODAY.isoformat(),
+                "target_period_start": self.P1[0].isoformat(),
+                "target_period_end": self.P1[1].isoformat(),
+                "description": "پرداخت فیس دوره اول",
+            },
+            format="json",
+        )
         self.assertEqual(response.status_code, 201, response.data)
-        self.assertEqual(len(response.data["allocations"]), 2)
+        self.assertEqual(len(response.data["allocations"]), 1)
+        self.assertEqual(response.data["description"], "پرداخت فیس دوره اول")
+        self.assertEqual(
+            Payment.objects.get(pk=response.data["id"]).description,
+            "پرداخت فیس دوره اول",
+        )
         self.assertConserved()
+
+    def test_corrected_payment_preserves_description(self):
+        payment = services.receive_payment(
+            driver=self.driver,
+            amount=D("600"),
+            payment_date=FIXED_TODAY,
+            user=self.user,
+            target_period=self.P1,
+            description="پرداخت دوره اول",
+        )
+        response = self.client.post(
+            f"/api/payments/{payment.id}/correct/",
+            {
+                "reason": "اصلاح دوره پرداخت",
+                "target_period_start": self.P1[0].isoformat(),
+                "target_period_end": self.P1[1].isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["description"], "پرداخت دوره اول")
+        self.assertConserved()
+
+    def test_correct_payment_api_returns_audit_actor(self):
+        payment = self.receive(600, self.P1, payment_date=date(2026, 1, 10))
+        response = self.client.post(
+            f"/api/payments/{payment.id}/correct/",
+            {
+                "reason": "اصلاح تاریخ",
+                "new_payment_date": FIXED_TODAY.isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        payment.refresh_from_db()
+        self.assertEqual(response.data["correction_of"], payment.id)
+        audit_response = self.client.get(f"/api/payments/{payment.id}/")
+        self.assertEqual(audit_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(audit_response.data["corrected_by"], self.user.id)
+        self.assertEqual(audit_response.data["corrected_by_name"], self.user.username)
+        self.assertEqual(payment.correction_reason, "اصلاح تاریخ")
+        self.assertEqual(response.data["payment_date"], FIXED_TODAY.isoformat())
 
     def test_idempotency_key(self):
         payload = {
@@ -1412,6 +2098,7 @@ class ConcurrencyTests(TransactionTestCase):
             driver_code="C1", full_name="تست", father_name="پ", phone="0700000000",
             tazkira_number="T1", plate_number="پ۱", address="کابل",
             registration_date=date(2026, 1, 1), fee_start_date=date(2026, 1, 1),
+            period_calendar=Driver.PERIOD_CALENDAR_GREGORIAN,
         )
         DriverFeeHistory.objects.create(
             driver=self.driver, requested_fee_start_date=date(2026, 1, 1),
@@ -1420,10 +2107,20 @@ class ConcurrencyTests(TransactionTestCase):
         self.P2 = (date(2026, 4, 1), date(2026, 6, 30))
 
     def _make_credit(self, amount):
-        payment = services.receive_payment(
-            driver=self.driver, amount=D(amount), payment_date=FIXED_TODAY, user=self.user
+        payment = Payment.objects.create(
+            driver=self.driver,
+            amount=D(amount),
+            payment_date=FIXED_TODAY,
+            effective_date=FIXED_TODAY,
+            created_by=self.user,
         )
-        return payment.allocations.get(allocation_type=AllocationType.CREDIT)
+        return PaymentAllocation.objects.create(
+            payment=payment,
+            allocation_type=AllocationType.CREDIT,
+            allocated_amount=D(amount),
+            effective_date=FIXED_TODAY,
+            allocated_by=self.user,
+        )
 
     def test_concurrent_consumption_v3a(self):
         credit = self._make_credit(300)
@@ -1635,6 +2332,7 @@ class OnlinePaymentTests(APITestCase):
             fee_start_date=date(2026, 11, 9),
             status=True,
             driver_type="guaranteed",
+            period_calendar=Driver.PERIOD_CALENDAR_GREGORIAN,
         )
 
     # ------------------------------------------------------------------
@@ -2332,3 +3030,683 @@ class OnlinePaymentTests(APITestCase):
                 expected.issubset(found),
                 f"Missing driver type triggers: {sorted(expected - found)}",
             )
+
+
+class PaymentAllocationLogicTests(FinancialTestBase):
+    """New receipts must be assigned to periods and cannot create new credit."""
+
+    def test_payment_requires_target_period(self):
+        """Payment without target_period is rejected at service layer."""
+        with self.assertRaises(FinancialError) as ctx:
+            self.receive(300)
+        self.assertEqual(ctx.exception.code, "target_period_required")
+        self.assertEqual(Payment.objects.count(), 0)
+
+    def test_large_payment_creates_enough_valid_period_allocations(self):
+        """All 5000 is assigned across consecutive periods, without credit."""
+        payment = services.receive_payment(
+            driver=self.driver, amount=D("5000"), payment_date=FIXED_TODAY,
+            user=self.user, target_period=self.P1, periods_count=1,
+        )
+        allocations = list(payment.allocations.order_by("target_period_start"))
+        self.assertEqual(len(allocations), 9)
+        self.assertEqual(
+            sum((item.allocated_amount for item in allocations), D("0")),
+            payment.amount,
+        )
+        self.assertEqual(allocations[-1].allocated_amount, D("200"))
+        self.assertFalse(
+            payment.allocations.filter(allocation_type=AllocationType.CREDIT).exists()
+        )
+        self.assertConserved()
+
+    def test_no_credit_allocation_is_created(self):
+        """Every allocation is FEE_PERIOD; no CREDIT allocation exists."""
+        payment = self.receive(600, self.P1)
+        allocs = payment.allocations.all()
+        self.assertEqual(allocs.count(), 1)
+        self.assertEqual(allocs[0].allocation_type, AllocationType.FEE_PERIOD)
+        self.assertEqual(payment.allocations.filter(allocation_type=AllocationType.CREDIT).count(), 0)
+
+    def test_existing_credit_remains_in_ledger_and_consumable(self):
+        """Historical credit allocations remain available after the new-payment change."""
+        payment = self.legacy_credit(300)
+        credit = payment.allocations.get(allocation_type=AllocationType.CREDIT)
+
+        ledger = DriverLedger(self.driver)
+        self.assertEqual(ledger.available_credit(), D("300"))
+        services.consume_credit(
+            source_allocation=credit,
+            amount=D("100"),
+            target_period=self.P2,
+            user=self.user,
+        )
+        self.assertEqual(DriverLedger(self.driver).available_credit(), D("200"))
+        self.assertEqual(self.state(self.P2).balance, D("500"))
+
+    def test_partial_payment_allocates_correctly(self):
+        """200 out of 600 on P1 is booked only on P1."""
+        payment = self.receive(200, self.P1)
+        fee = payment.allocations.get(allocation_type=AllocationType.FEE_PERIOD)
+        self.assertEqual(fee.allocated_amount, D("200"))
+        self.assertEqual(fee.target_period_start, self.P1[0])
+        self.assertEqual(self.state(self.P1).balance, D("400"))
+        self.assertEqual(payment.allocations.count(), 1)
+
+    def test_multi_period_payment_allocates_correctly(self):
+        """800 covers 600 of P1 and 200 of P2 across two consecutive periods."""
+        services.receive_payment(
+            driver=self.driver, amount=D("800"), payment_date=FIXED_TODAY,
+            user=self.user, target_period=self.P1, periods_count=2,
+        )
+        payment = Payment.objects.filter(driver=self.driver).order_by("-id").first()
+        allocs = list(payment.allocations.filter(
+            allocation_type=AllocationType.FEE_PERIOD
+        ).order_by("target_period_start"))
+        self.assertEqual(len(allocs), 2)
+        self.assertEqual(allocs[0].target_period_start, self.P1[0])
+        self.assertEqual(allocs[0].allocated_amount, D("600"))
+        self.assertEqual(allocs[1].target_period_start, self.P2[0])
+        self.assertEqual(allocs[1].allocated_amount, D("200"))
+        self.assertEqual(payment.allocations.filter(allocation_type=AllocationType.CREDIT).count(), 0)
+
+    def test_atomic_rollback_after_partial_allocation_failure(self):
+        """A failure after the first allocation rolls back the full operation."""
+        before_payment = Payment.objects.count()
+        before_alloc = PaymentAllocation.objects.count()
+        create_allocation = PaymentAllocation.objects.create
+        call_count = 0
+
+        def fail_on_second_allocation(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("simulated allocation failure")
+            return create_allocation(**kwargs)
+
+        with mock.patch.object(
+            PaymentAllocation.objects,
+            "create",
+            side_effect=fail_on_second_allocation,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated allocation failure"):
+                services.receive_payment(
+                    driver=self.driver, amount=D("800"), payment_date=FIXED_TODAY,
+                    user=self.user, target_period=self.P1,
+                )
+        self.assertEqual(call_count, 2)
+        self.assertEqual(Payment.objects.count(), before_payment)
+        self.assertEqual(PaymentAllocation.objects.count(), before_alloc)
+
+
+@skipUnlessDBFeature("has_select_for_update")
+class ConcurrentPaymentTests(TransactionTestCase):
+    """PostgreSQL race-condition tests using independent committed connections."""
+
+    databases = {"default"}
+
+    def setUp(self):
+        patch_now = mock.patch.object(timezone, "now", return_value=FIXED_NOW)
+        patch_today = mock.patch.object(timezone, "localdate", return_value=FIXED_TODAY)
+        patch_now.start()
+        patch_today.start()
+        self.addCleanup(patch_now.stop)
+        self.addCleanup(patch_today.stop)
+        FeeSchedule.objects.get_or_create(
+            effective_from=date(1900, 1, 1),
+            defaults={"amount": D("600"), "reason": "seed", "created_by": None},
+        )
+        self.user = User.objects.create_user(
+            username="concurrent-admin", password="pass", is_superuser=True
+        )
+        self.driver = self.make_driver("C1")
+        self.P1 = (date(2026, 1, 1), date(2026, 3, 31))
+        self.P2 = (date(2026, 4, 1), date(2026, 6, 30))
+
+    def make_driver(self, code):
+        driver = Driver.objects.create(
+            driver_code=code,
+            full_name=f"راننده {code}",
+            father_name="پدر",
+            phone="0700000000",
+            tazkira_number=f"T{code}",
+            plate_number=f"پ{code}",
+            address="کابل",
+            registration_date=date(2026, 1, 1),
+            fee_start_date=date(2026, 1, 1),
+            period_calendar=Driver.PERIOD_CALENDAR_GREGORIAN,
+        )
+        DriverFeeHistory.objects.create(
+            driver=driver,
+            old_fee_start_date=None,
+            requested_fee_start_date=date(2026, 1, 1),
+            effective_fee_start_date=date(2026, 1, 1),
+            reason="ردیف اولیه تست",
+            changed_by=self.user,
+        )
+        return driver
+
+    def receive(self, amount, period, driver=None):
+        return services.receive_payment(
+            driver=driver or self.driver,
+            amount=D(amount),
+            payment_date=FIXED_TODAY,
+            user=self.user,
+            target_period=period,
+        )
+
+    def transfer(self, amount, source, destination, driver=None):
+        return services.create_transfer(
+            driver=driver or self.driver,
+            amount=D(amount),
+            source_period=source,
+            destination_period=destination,
+            user=self.user,
+            reason="انتقال هم‌زمانی",
+        )
+
+    def assert_conserved(self, driver=None):
+        report = conservation_report(driver or self.driver, FIXED_TODAY)
+        self.assertTrue(report["all_ok"], report["equations"])
+
+    def _run_concurrently(self, operations):
+        barrier = threading.Barrier(len(operations) + 1)
+        outcomes = [None] * len(operations)
+        connection_ids = [None] * len(operations)
+
+        def worker(index, operation):
+            close_old_connections()
+            db = connections["default"]
+            try:
+                db.ensure_connection()
+                with db.cursor() as cursor:
+                    cursor.execute("SET lock_timeout = '15s'")
+                    cursor.execute("SELECT pg_backend_pid()")
+                    connection_ids[index] = cursor.fetchone()[0]
+                barrier.wait(timeout=10)
+                outcomes[index] = {"value": operation(), "error": None}
+            except Exception as exc:
+                outcomes[index] = {"value": None, "error": exc}
+            finally:
+                db.close()
+
+        threads = [
+            threading.Thread(
+                target=worker,
+                args=(index, operation),
+                name=f"financial-concurrency-{index}",
+                daemon=True,
+            )
+            for index, operation in enumerate(operations)
+        ]
+        for thread in threads:
+            thread.start()
+        barrier_error = None
+        try:
+            barrier.wait(timeout=10)
+        except threading.BrokenBarrierError as exc:
+            barrier_error = exc
+        for thread in threads:
+            thread.join(timeout=20)
+
+        self.assertFalse(
+            any(thread.is_alive() for thread in threads),
+            "A worker exceeded the bounded 20-second join.",
+        )
+        self.assertIsNone(
+            barrier_error,
+            f"Workers did not reach the start barrier: {barrier_error}",
+        )
+        self.assertTrue(all(outcome is not None for outcome in outcomes), outcomes)
+        self.assertEqual(
+            len(set(connection_ids)),
+            len(operations),
+            f"Workers did not use independent PostgreSQL sessions: {connection_ids}",
+        )
+        return outcomes
+
+    def test_concurrent_same_period_payments_spill_into_next_period(self):
+        outcomes = self._run_concurrently(
+            [
+                lambda: self.receive(600, self.P1),
+                lambda: self.receive(600, self.P1),
+            ]
+        )
+        self.assertTrue(all(item["error"] is None for item in outcomes), outcomes)
+        active = PaymentAllocation.objects.filter(
+            payment__driver=self.driver,
+            allocation_type=AllocationType.FEE_PERIOD,
+            reversed_at__isnull=True,
+        ).order_by("target_period_start", "id")
+        self.assertEqual(
+            list(active.values_list("target_period_start", "allocated_amount")),
+            [(self.P1[0], D("600")), (self.P2[0], D("600"))],
+        )
+        self.assert_conserved()
+
+    def test_concurrent_idempotency_same_key(self):
+        outcomes = self._run_concurrently(
+            [
+                lambda: self.receive_with_key("600", "same-key"),
+                lambda: self.receive_with_key("600", "same-key"),
+            ]
+        )
+        self.assertTrue(all(item["error"] is None for item in outcomes), outcomes)
+        self.assertEqual(outcomes[0]["value"].pk, outcomes[1]["value"].pk)
+        self.assertEqual(Payment.objects.filter(driver=self.driver).count(), 1)
+        payment = Payment.objects.get(driver=self.driver)
+        self.assertEqual(payment.allocations.count(), 1)
+        self.assertEqual(ActivityLog.objects.filter(action="payment_receive").count(), 1)
+        self.assert_conserved()
+
+    def receive_with_key(self, amount, key):
+        return services.receive_payment(
+            driver=self.driver,
+            amount=D(amount),
+            payment_date=FIXED_TODAY,
+            user=self.user,
+            target_period=self.P1,
+            idempotency_key=key,
+        )
+
+    def test_concurrent_payments_for_different_periods(self):
+        outcomes = self._run_concurrently(
+            [
+                lambda: self.receive(600, self.P1),
+                lambda: self.receive(600, self.P2),
+            ]
+        )
+        self.assertTrue(all(item["error"] is None for item in outcomes), outcomes)
+        self.assertEqual(Payment.objects.filter(driver=self.driver).count(), 2)
+        self.assertEqual(
+            set(
+                PaymentAllocation.objects.filter(
+                    payment__driver=self.driver,
+                    reversed_at__isnull=True,
+                ).values_list("target_period_start", flat=True)
+            ),
+            {self.P1[0], self.P2[0]},
+        )
+        self.assert_conserved()
+
+    def test_concurrent_void_same_payment(self):
+        payment = self.receive(600, self.P1)
+        outcomes = self._run_concurrently(
+            [
+                lambda: services.void_payment(
+                    payment=Payment.objects.get(pk=payment.pk),
+                    user=self.user,
+                    reason="ابطال هم‌زمان ۱",
+                ),
+                lambda: services.void_payment(
+                    payment=Payment.objects.get(pk=payment.pk),
+                    user=self.user,
+                    reason="ابطال هم‌زمان ۲",
+                ),
+            ]
+        )
+        self.assertEqual(sum(item["error"] is None for item in outcomes), 1, outcomes)
+        self.assertEqual(
+            sum(isinstance(item["error"], FinancialError) for item in outcomes), 1
+        )
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, PaymentStatus.VOIDED)
+        self.assertFalse(
+            payment.allocations.filter(reversed_at__isnull=True).exists()
+        )
+        self.assert_conserved()
+
+    def test_concurrent_correct_same_payment(self):
+        payment = self.receive(600, self.P1)
+        outcomes = self._run_concurrently(
+            [
+                lambda: services.correct_payment(
+                    payment=Payment.objects.get(pk=payment.pk),
+                    user=self.user,
+                    reason="اصلاح هم‌زمان ۱",
+                    new_amount=D("700"),
+                ),
+                lambda: services.correct_payment(
+                    payment=Payment.objects.get(pk=payment.pk),
+                    user=self.user,
+                    reason="اصلاح هم‌زمان ۲",
+                    new_amount=D("800"),
+                ),
+            ]
+        )
+        self.assertEqual(sum(item["error"] is None for item in outcomes), 1, outcomes)
+        self.assertEqual(
+            sum(isinstance(item["error"], FinancialError) for item in outcomes), 1
+        )
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, PaymentStatus.CORRECTED)
+        replacements = Payment.objects.filter(correction_of=payment)
+        self.assertEqual(replacements.count(), 1)
+        replacement = replacements.get()
+        self.assertEqual(
+            replacement.allocations.filter(reversed_at__isnull=True).aggregate(
+                total=models.Sum("allocated_amount")
+            )["total"],
+            replacement.amount,
+        )
+        self.assert_conserved()
+
+    def test_concurrent_refund_same_payment(self):
+        payment = self.receive(600, self.P1)
+        outcomes = self._run_concurrently(
+            [
+                lambda: services.refund_payment(
+                    payment=Payment.objects.get(pk=payment.pk),
+                    amount=D("400"),
+                    refund_date=FIXED_TODAY,
+                    user=self.user,
+                    reason="برگشت هم‌زمان ۱",
+                ),
+                lambda: services.refund_payment(
+                    payment=Payment.objects.get(pk=payment.pk),
+                    amount=D("400"),
+                    refund_date=FIXED_TODAY,
+                    user=self.user,
+                    reason="برگشت هم‌زمان ۲",
+                ),
+            ]
+        )
+        self.assertEqual(sum(item["error"] is None for item in outcomes), 1, outcomes)
+        self.assertEqual(
+            sum(isinstance(item["error"], FinancialError) for item in outcomes), 1
+        )
+        self.assertEqual(
+            PaymentRefund.objects.filter(payment=payment).aggregate(
+                total=models.Sum("amount")
+            )["total"],
+            D("400"),
+        )
+        self.assertEqual(
+            payment.allocations.filter(reversed_at__isnull=True).aggregate(
+                total=models.Sum("allocated_amount")
+            )["total"],
+            D("200"),
+        )
+        self.assert_conserved()
+
+    def test_concurrent_waiver_same_period(self):
+        outcomes = self._run_concurrently(
+            [
+                lambda: services.create_waiver(
+                    driver=Driver.objects.get(pk=self.driver.pk),
+                    amount=D("400"),
+                    source_period=self.P1,
+                    user=self.user,
+                    reason="بخشش هم‌زمان ۱",
+                ),
+                lambda: services.create_waiver(
+                    driver=Driver.objects.get(pk=self.driver.pk),
+                    amount=D("400"),
+                    source_period=self.P1,
+                    user=self.user,
+                    reason="بخشش هم‌زمان ۲",
+                ),
+            ]
+        )
+        self.assertEqual(sum(item["error"] is None for item in outcomes), 1, outcomes)
+        self.assertEqual(
+            Adjustment.objects.filter(
+                driver=self.driver, adjustment_type=AdjustmentType.WAIVER
+            ).aggregate(total=models.Sum("amount"))["total"],
+            D("400"),
+        )
+        self.assertEqual(
+            DriverLedger(self.driver).period_state(*self.P1).balance, D("200")
+        )
+        self.assert_conserved()
+
+    def test_concurrent_transfer_same_periods(self):
+        outcomes = self._run_concurrently(
+            [
+                lambda: self.transfer(400, self.P1, self.P2),
+                lambda: self.transfer(400, self.P1, self.P2),
+            ]
+        )
+        self.assertEqual(sum(item["error"] is None for item in outcomes), 1, outcomes)
+        self.assertEqual(
+            Adjustment.objects.filter(
+                driver=self.driver, adjustment_type=AdjustmentType.TRANSFER
+            ).aggregate(total=models.Sum("amount"))["total"],
+            D("400"),
+        )
+        self.assertEqual(
+            DriverLedger(self.driver).period_state(*self.P1).balance, D("200")
+        )
+        self.assert_conserved()
+
+    def test_concurrent_reverse_same_adjustment(self):
+        transfer = self.transfer(300, self.P1, self.P2)
+        outcomes = self._run_concurrently(
+            [
+                lambda: services.reverse_adjustment(
+                    adjustment=Adjustment.objects.get(pk=transfer.pk),
+                    amount=D("200"),
+                    user=self.user,
+                    reason="بازگشت هم‌زمان ۱",
+                ),
+                lambda: services.reverse_adjustment(
+                    adjustment=Adjustment.objects.get(pk=transfer.pk),
+                    amount=D("200"),
+                    user=self.user,
+                    reason="بازگشت هم‌زمان ۲",
+                ),
+            ]
+        )
+        self.assertEqual(sum(item["error"] is None for item in outcomes), 1, outcomes)
+        self.assertEqual(
+            Adjustment.objects.filter(
+                reverses_adjustment=transfer
+            ).aggregate(total=models.Sum("amount"))["total"],
+            D("200"),
+        )
+        self.assert_conserved()
+
+    def test_concurrent_unsettle_and_reverse_same_adjustment(self):
+        transfer = self.transfer(300, self.P1, self.P2)
+        self.receive(900, self.P2)
+        outcomes = self._run_concurrently(
+            [
+                lambda: services.unsettle_and_reverse(
+                    adjustment=Adjustment.objects.get(pk=transfer.pk),
+                    amount=D("300"),
+                    user=self.user,
+                    reason="بازگشایی هم‌زمان",
+                ),
+                lambda: services.reverse_adjustment(
+                    adjustment=Adjustment.objects.get(pk=transfer.pk),
+                    amount=D("300"),
+                    user=self.user,
+                    reason="بازگشت هم‌زمان",
+                ),
+            ]
+        )
+        self.assertEqual(sum(item["error"] is None for item in outcomes), 1, outcomes)
+        self.assertEqual(
+            Adjustment.objects.filter(
+                reverses_adjustment=transfer
+            ).aggregate(total=models.Sum("amount"))["total"],
+            D("300"),
+        )
+        self.assertEqual(DriverLedger(self.driver).available_credit(), D("300"))
+        self.assert_conserved()
+
+    def test_opposite_direction_payment_corrections_lock_drivers_by_pk(self):
+        other_driver = self.make_driver("C2")
+        left_payment = self.receive(200, self.P1, self.driver)
+        right_payment = self.receive(200, self.P1, other_driver)
+        outcomes = self._run_concurrently(
+            [
+                lambda: services.correct_payment(
+                    payment=Payment.objects.get(pk=left_payment.pk),
+                    user=self.user,
+                    reason="انتقال اصلاحی چپ",
+                    new_driver=Driver.objects.get(pk=other_driver.pk),
+                ),
+                lambda: services.correct_payment(
+                    payment=Payment.objects.get(pk=right_payment.pk),
+                    user=self.user,
+                    reason="انتقال اصلاحی راست",
+                    new_driver=Driver.objects.get(pk=self.driver.pk),
+                ),
+            ]
+        )
+        self.assertTrue(all(item["error"] is None for item in outcomes), outcomes)
+        self.assertEqual(
+            Payment.objects.get(correction_of=left_payment).driver_id,
+            other_driver.pk,
+        )
+        self.assertEqual(
+            Payment.objects.get(correction_of=right_payment).driver_id,
+            self.driver.pk,
+        )
+        self.assert_conserved(self.driver)
+        self.assert_conserved(other_driver)
+
+    def test_concurrent_fee_start_date_changes_preserve_both_history_rows(self):
+        outcomes = self._run_concurrently(
+            [
+                lambda: services.change_fee_start_date(
+                    driver=Driver.objects.get(pk=self.driver.pk),
+                    requested=date(2027, 1, 15),
+                    user=self.user,
+                    reason="تغییر هم‌زمان ۱",
+                ),
+                lambda: services.change_fee_start_date(
+                    driver=Driver.objects.get(pk=self.driver.pk),
+                    requested=date(2027, 4, 4),
+                    user=self.user,
+                    reason="تغییر هم‌زمان ۲",
+                ),
+            ]
+        )
+        self.assertTrue(all(item["error"] is None for item in outcomes), outcomes)
+        history = list(
+            DriverFeeHistory.objects.filter(driver=self.driver).order_by(
+                "changed_at", "id"
+            )
+        )
+        self.assertEqual(len(history), 3)
+        self.assertEqual(
+            {item.requested_fee_start_date for item in history[1:]},
+            {date(2027, 1, 15), date(2027, 4, 4)},
+        )
+        self.driver.refresh_from_db()
+        self.assertEqual(
+            self.driver.fee_start_date, history[-1].requested_fee_start_date
+        )
+
+    def test_concurrent_fee_schedule_change_and_payment_are_serialized(self):
+        next_period = (date(2027, 1, 1), date(2027, 3, 31))
+        outcomes = self._run_concurrently(
+            [
+                lambda: services.change_fee_schedule(
+                    amount=D("900"),
+                    effective_from=next_period[0],
+                    user=self.user,
+                    reason="تغییر هم‌زمان فیس",
+                ),
+                lambda: self.receive(900, next_period),
+            ]
+        )
+        self.assertTrue(all(item["error"] is None for item in outcomes), outcomes)
+        payment = next(
+            item["value"] for item in outcomes if isinstance(item["value"], Payment)
+        )
+        self.assertEqual(
+            payment.allocations.filter(reversed_at__isnull=True).aggregate(
+                total=models.Sum("allocated_amount")
+            )["total"],
+            D("900"),
+        )
+        self.assertEqual(
+            FeeSchedule.objects.get(effective_from=next_period[0]).amount,
+            D("900"),
+        )
+        self.assert_conserved()
+
+
+class FinancialActivityLogTests(FinancialTestBase):
+    """Financial operations write accurate, transaction-consistent audit entries."""
+
+    def test_receive_payment_creates_accurate_success_log(self):
+        payment = self.receive(600, self.P1)
+
+        entry = ActivityLog.objects.get(action="payment_receive")
+        self.assertEqual(entry.module, ActivityLog.Module.PAYMENTS)
+        self.assertEqual(entry.status, ActivityLog.Status.SUCCESS)
+        self.assertEqual(entry.actor, self.user)
+        self.assertEqual(entry.actor_username, self.user.username)
+        self.assertEqual(entry.target_type, "payment")
+        self.assertEqual(entry.target_id, str(payment.pk))
+        self.assertEqual(
+            entry.target_label,
+            f"{self.driver.driver_code} — {self.driver.full_name}",
+        )
+        self.assertEqual(entry.after_data["payment_id"], payment.pk)
+        self.assertEqual(entry.after_data["driver_id"], self.driver.pk)
+        self.assertEqual(entry.after_data["amount"], "600")
+        self.assertEqual(entry.after_data["payment_date"], "2026-11-10")
+        self.assertEqual(entry.before_data, None)
+
+    def test_successful_transfer_creates_adjustment_log(self):
+        # P1 is left unpaid, so it carries the debt balance that gets transferred.
+        balance = self.state(self.P1).balance
+        self.assertGreater(balance, 0)
+        services.create_transfer(
+            driver=self.driver,
+            amount=balance,
+            source_period=self.P1,
+            destination_period=self.P2,
+            user=self.user,
+            reason="انتقال آزمایشی",
+        )
+        entry = ActivityLog.objects.get(action="transfer_create")
+        self.assertEqual(entry.module, ActivityLog.Module.PAYMENTS)
+        self.assertEqual(entry.status, ActivityLog.Status.SUCCESS)
+        self.assertEqual(entry.actor, self.user)
+
+    def test_failed_financial_operation_is_not_logged_as_success(self):
+        with self.assertRaises(FinancialError):
+            self.receive(-5)
+        self.assertFalse(ActivityLog.objects.filter(action="payment_receive").exists())
+
+    def test_log_rolls_back_with_the_operation(self):
+        with self.assertRaises(RuntimeError):
+            with transaction.atomic():
+                self.receive(600, self.P1)
+                # The entry exists while the outer transaction is still open...
+                self.assertTrue(
+                    ActivityLog.objects.filter(action="payment_receive").exists()
+                )
+                raise RuntimeError("failure after the operation")
+        # ...and disappears together with the rolled-back operation.
+        self.assertFalse(ActivityLog.objects.filter(action="payment_receive").exists())
+        self.assertEqual(Payment.objects.filter(driver=self.driver).count(), 0)
+
+    def test_idempotent_replay_does_not_duplicate_payment_logs(self):
+        key = uuid.uuid4().hex
+        first = services.receive_payment(
+            driver=self.driver,
+            amount=D("600"),
+            payment_date=FIXED_TODAY,
+            user=self.user,
+            target_period=self.P1,
+            idempotency_key=key,
+        )
+        second = services.receive_payment(
+            driver=self.driver,
+            amount=D("600"),
+            payment_date=FIXED_TODAY,
+            user=self.user,
+            target_period=self.P1,
+            idempotency_key=key,
+        )
+        self.assertEqual(first.pk, second.pk)
+        self.assertEqual(
+            ActivityLog.objects.filter(action="payment_receive").count(), 1
+        )

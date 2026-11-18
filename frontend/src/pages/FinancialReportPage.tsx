@@ -1,12 +1,21 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ArrowRightIcon, CalendarIcon, RefreshIcon } from '../components/icons'
+import {
+  ArrowRightIcon,
+  CalendarIcon,
+  PrinterIcon,
+  RefreshIcon,
+} from '../components/icons'
 import { Button } from '../components/ui/Button'
 import { PageHeader } from '../components/ui/PageHeader'
 import { useToast } from '../context/ToastContext'
 import { fetchFinancialReport } from '../lib/api'
 import { formatJalaliShort, toPersianDigits, todayIsoKabul } from '../lib/dates'
 import { getErrorMessage, isAbortError } from '../lib/errors'
+import {
+  downloadFinancialReportCsv,
+  financialReportArchiveLabels,
+} from '../lib/financialReportExport'
 import type { FinancialReport } from '../types/financial'
 
 function MetricCard({
@@ -39,6 +48,8 @@ export function FinancialReportPage() {
   const [asOf, setAsOf] = useState<string>(todayIsoKabul())
   const [dateFrom, setDateFrom] = useState<string>('')
   const [dateTo, setDateTo] = useState<string>('')
+  const [archiveStatus, setArchiveStatus] =
+    useState<FinancialReport['archive_status']>('active')
   const { notify } = useToast()
 
   // Spec F4: the report range must end on or before the report date, so the
@@ -47,11 +58,13 @@ export function FinancialReportPage() {
 
   const load = useCallback(async () => {
     setError(null)
+    setReport(null)
     try {
       const data = await fetchFinancialReport(
         asOf || undefined,
         dateFrom || undefined,
         dateTo || undefined,
+        archiveStatus,
       )
       setReport(data)
     } catch (cause) {
@@ -61,7 +74,7 @@ export function FinancialReportPage() {
         notify('error', msg)
       }
     }
-  }, [asOf, dateFrom, dateTo, notify])
+  }, [archiveStatus, asOf, dateFrom, dateTo, notify])
 
   useEffect(() => {
     load()
@@ -69,7 +82,7 @@ export function FinancialReportPage() {
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex items-center justify-between gap-3 print:hidden">
         <Link
           to="/financial"
           className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-600 transition hover:text-slate-900"
@@ -79,24 +92,69 @@ export function FinancialReportPage() {
         </Link>
       </div>
 
-      <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+      <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm print:hidden">
         <PageHeader
           title="گزارش مالی جامع"
           description="پرداخت‌ها، درآمد، بدهی‌ها، اعتبارها و وضعیت مالی رانندگان در بازه انتخاب‌شده."
+          actions={
+            report && (
+              <>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => window.print()}
+                  icon={<PrinterIcon className="size-4" />}
+                >
+                  چاپ / ذخیره PDF
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => downloadFinancialReportCsv(report)}
+                >
+                  دریافت Excel (CSV)
+                </Button>
+              </>
+            )
+          }
         />
 
         <form className="space-y-4 p-5" onSubmit={(e) => { e.preventDefault(); load() }}>
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-slate-600" htmlFor="report-archive-status">
+                وضعیت آرشیف رانندگان
+              </label>
+              <select
+                id="report-archive-status"
+                className="block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 shadow-xs outline-none transition hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
+                value={archiveStatus}
+                onChange={(event) => {
+                  const value = event.target.value
+                  if (value === 'active' || value === 'archived' || value === 'all') {
+                    setArchiveStatus(value)
+                    setReport(null)
+                  }
+                }}
+              >
+                <option value="active">رانندگان فعال</option>
+                <option value="archived">رانندگان آرشیف‌شده</option>
+                <option value="all">همه رانندگان</option>
+              </select>
+            </div>
             <div className="flex flex-col gap-1">
               <label className="text-xs font-medium text-slate-600" htmlFor="report-as-of">
                 تاریخ محاسبه (اختیاری)
               </label>
               <input
                 id="report-as-of"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                className="block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr shadow-xs outline-none transition hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
                 type="date"
                 value={asOf}
-                onChange={(e) => setAsOf(e.target.value)}
+                onChange={(e) => {
+                  setAsOf(e.target.value)
+                  setReport(null)
+                }}
               />
             </div>
 
@@ -106,11 +164,14 @@ export function FinancialReportPage() {
               </label>
               <input
                 id="report-from"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                className="block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr shadow-xs outline-none transition hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
                 type="date"
                 value={dateFrom}
                 max={dateTo || reportDate}
-                onChange={(e) => setDateFrom(e.target.value)}
+                onChange={(e) => {
+                  setDateFrom(e.target.value)
+                  setReport(null)
+                }}
               />
             </div>
 
@@ -120,11 +181,14 @@ export function FinancialReportPage() {
               </label>
               <input
                 id="report-to"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                className="block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr shadow-xs outline-none transition hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
                 type="date"
                 value={dateTo}
                 max={reportDate}
-                onChange={(e) => setDateTo(e.target.value)}
+                onChange={(e) => {
+                  setDateTo(e.target.value)
+                  setReport(null)
+                }}
               />
             </div>
 
@@ -138,12 +202,13 @@ export function FinancialReportPage() {
           <p className="text-xs text-slate-500">
             «از تاریخ» و «تا تاریخ» باید با هم انتخاب شوند. پرداخت‌ها و درآمد بر اساس همین بازه
             محاسبه می‌شوند؛ بدهی و اعتبار وضعیت راننده در «تاریخ محاسبه» است.
+            وضعیت فعال به رانندگان غیروآرشیف‌شده با وضعیت فعال اشاره دارد.
           </p>
         </form>
       </section>
 
       {error && (
-        <div className="flex items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 print:hidden">
           <p>{error}</p>
           <Button variant="secondary" size="sm" onClick={load} icon={<RefreshIcon className="size-4" />}>
             تلاش دوباره
@@ -153,7 +218,7 @@ export function FinancialReportPage() {
 
       {report && (
         <>
-          <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 print:hidden">
             <MetricCard
               label="پرداخت‌های بازه"
               value={toPersianDigits(report.payments.count.toString())}
@@ -178,7 +243,7 @@ export function FinancialReportPage() {
             />
           </section>
 
-          <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+          <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm print:hidden">
             <div className="flex flex-wrap items-center justify-between border-b border-slate-200 px-5 py-4">
               <div>
                 <h2 className="text-sm font-semibold text-slate-800">وضعیت مالی رانندگان</h2>
@@ -218,7 +283,7 @@ export function FinancialReportPage() {
                         <td className="px-4 py-2 text-right">
                           <Link
                             to={`/financial/drivers/${row.driver_id}`}
-                            className="font-medium text-slate-800 hover:text-blue-700"
+                            className="font-medium text-slate-800 hover:text-brand-700"
                           >
                             {row.driver_code}
                           </Link>
@@ -255,6 +320,95 @@ export function FinancialReportPage() {
                 </table>
               </div>
             )}
+          </section>
+
+          <section className="print-sheet hidden print:block">
+            <header style={{ borderBottom: '2px solid #0f172a', paddingBottom: '8pt', marginBottom: '10pt' }}>
+              <h1 style={{ fontSize: '15pt', fontWeight: 700, textAlign: 'center' }}>
+                گزارش مالی جامع رانندگان
+              </h1>
+              <p style={{ fontSize: '9pt', textAlign: 'center', color: '#475569', marginTop: '2pt' }}>
+                {financialReportArchiveLabels[report.archive_status]}
+              </p>
+            </header>
+
+            <table style={{ marginBottom: '10pt' }}>
+              <tbody>
+                <tr>
+                  <th style={{ width: '30%', textAlign: 'right' }}>تاریخ محاسبه</th>
+                  <td style={{ textAlign: 'left' }}>{formatJalaliShort(report.as_of)}</td>
+                </tr>
+                <tr>
+                  <th style={{ textAlign: 'right' }}>از تاریخ</th>
+                  <td style={{ textAlign: 'left' }}>
+                    {report.date_from ? formatJalaliShort(report.date_from) : 'تمام دوره'}
+                  </td>
+                </tr>
+                <tr>
+                  <th style={{ textAlign: 'right' }}>تا تاریخ</th>
+                  <td style={{ textAlign: 'left' }}>
+                    {report.date_to ? formatJalaliShort(report.date_to) : 'تمام دوره'}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <table style={{ marginBottom: '10pt', fontSize: '8pt' }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: 'right' }}>شاخص</th>
+                  <th style={{ textAlign: 'left' }}>مقدار</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td>تعداد پرداخت‌ها</td><td dir="ltr">{toPersianDigits(report.payments.count.toString())}</td></tr>
+                <tr><td>مجموع پرداخت‌ها</td><td dir="ltr">{toPersianDigits(report.payments.total_amount)} AFN</td></tr>
+                <tr><td>درآمد نقدی</td><td dir="ltr">{toPersianDigits(report.revenue.cash_revenue)} AFN</td></tr>
+                <tr><td>ثبت حسابرسی</td><td dir="ltr">{toPersianDigits(report.revenue.recorded_as_of_audit)} AFN</td></tr>
+                <tr><td>بدهی کل</td><td dir="ltr">{toPersianDigits(report.debt.total_balance)} AFN</td></tr>
+                <tr><td>تعهد جاری</td><td dir="ltr">{toPersianDigits(report.debt.current_obligation)} AFN</td></tr>
+                <tr><td>بدهی معوق</td><td dir="ltr">{toPersianDigits(report.debt.overdue_debt)} AFN</td></tr>
+                <tr><td>فیس در بازه</td><td dir="ltr">{toPersianDigits(report.debt.fee_in_range)} AFN</td></tr>
+                <tr><td>اعتبار در دسترس</td><td dir="ltr">{toPersianDigits(report.credit.available_total)} AFN</td></tr>
+                <tr><td>اعتبار تخصیص‌یافته</td><td dir="ltr">{toPersianDigits(report.credit.allocated_total)} AFN</td></tr>
+                <tr><td>تعداد رانندگان</td><td dir="ltr">{toPersianDigits(report.totals.driver_count.toString())}</td></tr>
+                <tr><td>رانندگان با پایستگی مالی</td><td dir="ltr">{toPersianDigits(report.totals.drivers_conserving.toString())}</td></tr>
+              </tbody>
+            </table>
+
+            <h2 style={{ fontSize: '10pt', fontWeight: 700, margin: '8pt 0 4pt' }}>
+              وضعیت مالی رانندگان
+            </h2>
+            <table style={{ fontSize: '7pt' }}>
+              <thead>
+                <tr>
+                  <th>شماره مسلسل</th>
+                  <th>نام راننده</th>
+                  <th>پرداخت‌ها</th>
+                  <th>مجموع پرداخت</th>
+                  <th>بدهی کل</th>
+                  <th>تعهد جاری</th>
+                  <th>بدهی معوق</th>
+                  <th>اعتبار</th>
+                  <th>پایستگی</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.drivers.map((row) => (
+                  <tr key={row.driver_id}>
+                    <td>{row.driver_code}</td>
+                    <td>{row.full_name}</td>
+                    <td dir="ltr">{toPersianDigits(row.payments_count.toString())}</td>
+                    <td dir="ltr">{toPersianDigits(row.payments_total)}</td>
+                    <td dir="ltr">{toPersianDigits(row.total_balance)}</td>
+                    <td dir="ltr">{toPersianDigits(row.current_obligation)}</td>
+                    <td dir="ltr">{toPersianDigits(row.overdue_debt)}</td>
+                    <td dir="ltr">{toPersianDigits(row.available_credit)}</td>
+                    <td>{row.conservation_ok ? 'برقرار' : 'نقض'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </section>
         </>
       )}

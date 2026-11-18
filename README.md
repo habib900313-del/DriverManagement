@@ -1,14 +1,12 @@
 # Driver Management System
 
-A fully offline, single-administrator driver management application for one
-local Mac. Records live in a local **PostgreSQL** server; photos and documents
-live on the local disk.
-No cloud services, no external hosting, and no internet connection is needed
-during normal operation.
+Django REST and React application for driver, document, and financial
+management. Local-development instructions remain below. For the separate
+Ubuntu production configuration and Nginx/Gunicorn templates, see
+[docs/PRODUCTION_DEPLOYMENT.md](docs/PRODUCTION_DEPLOYMENT.md).
 
-> **Status: environment ready.** The toolchain is upgraded to Python 3.14.10 /
-> Django 5.2.19 / DRF 3.18.3. The `Driver`, `Payment` and `Document` models and
-> the business logic have **not** been implemented yet.
+> Production configuration is prepared as a template only. No VPS deployment
+> or production database operation has been performed.
 
 ---
 

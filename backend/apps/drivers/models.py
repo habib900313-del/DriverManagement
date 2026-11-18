@@ -56,9 +56,15 @@ def driver_photo_upload_to(instance: "Driver", filename: str) -> str:
 
 
 class Driver(models.Model):
+    PERIOD_CALENDAR_GREGORIAN = "gregorian"
+    PERIOD_CALENDAR_JALALI = "jalali"
+    PERIOD_CALENDAR_CHOICES = [
+        (PERIOD_CALENDAR_GREGORIAN, "میلادی — دوره‌های قبلی"),
+        (PERIOD_CALENDAR_JALALI, "هجری شمسی"),
+    ]
+
     driver_code = models.CharField(
         max_length=50,
-        unique=True,
         verbose_name="شماره مسلسل",
         help_text="شماره مسلسل دستی و یکتای راننده",
     )
@@ -112,6 +118,12 @@ class Driver(models.Model):
         ],
         verbose_name="تاریخ شروع فیس",
     )
+    period_calendar = models.CharField(
+        max_length=16,
+        choices=PERIOD_CALENDAR_CHOICES,
+        default=PERIOD_CALENDAR_JALALI,
+        verbose_name="تقویم دوره‌های مالی",
+    )
     status = models.BooleanField(default=True, verbose_name="وضعیت فعال")
     driver_type = models.CharField(
         max_length=20,
@@ -133,13 +145,7 @@ class Driver(models.Model):
         verbose_name = "راننده"
         verbose_name_plural = "رانندگان"
         constraints = [
-            # Enforce case-insensitive uniqueness in SQLite itself, not only
-            # in the serializer, so direct ORM writes cannot create near-dupes.
-            models.UniqueConstraint(
-                Lower("driver_code"),
-                name="uniq_driver_code_case_insensitive",
-            ),
-            # Ensure deleted driver codes are never reused
+            # Keep codes unique among active drivers; archived codes may be reused.
             models.UniqueConstraint(
                 Lower("driver_code"),
                 name="uniq_driver_code_not_reused",

@@ -1,11 +1,15 @@
 import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { DriverAvatar } from '../components/DriverAvatar'
+import { DriverDocumentsErrorBoundary } from '../components/DriverDocumentsErrorBoundary'
+import { DriverPaymentHistory } from '../components/DriverPaymentHistory'
+import { DriverDocumentsSection } from '../components/DriverDocumentsSection'
 import { DriverPeriodPayments } from '../components/DriverPeriodPayments'
 import {
   AlertCircleIcon,
   ArrowRightIcon,
+  ArchiveIcon,
   CalendarIcon,
   CarIcon,
   CheckCircleIcon,
@@ -19,11 +23,12 @@ import {
   UsersIcon,
   XCircleIcon,
 } from '../components/icons'
-import { StatusBadge } from '../components/ui/Badge'
 import { Button } from '../components/ui/Button'
 import { Spinner } from '../components/ui/Spinner'
+import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
 import {
+  archiveDriver,
   fetchDriver,
   fetchFinancialSummary,
   fetchDriverPeriodCoverage,
@@ -102,6 +107,9 @@ function DateValue({ iso }: { iso: string }) {
 }
 
 export function DriverProfilePage() {
+  const { user } = useAuth()
+  const canManage = Boolean(user?.is_staff || user?.is_superuser)
+  const navigate = useNavigate()
   const { id } = useParams()
   const driverId = Number(id)
   const [driver, setDriver] = useState<Driver | null>(null)
@@ -111,6 +119,8 @@ export function DriverProfilePage() {
   const [error, setError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
   const [statusBusy, setStatusBusy] = useState(false)
+  const [archiveBusy, setArchiveBusy] = useState(false)
+  const [archiveError, setArchiveError] = useState<string | null>(null)
   const { notify } = useToast()
 
   useEffect(() => {
@@ -151,7 +161,7 @@ export function DriverProfilePage() {
   }, [driverId, reloadKey])
 
   const handleToggle = async () => {
-    if (!driver || statusBusy) return
+    if (!driver || statusBusy || archiveBusy) return
     setStatusBusy(true)
     try {
       const updated = await setDriverStatus(driver.id, !driver.status)
@@ -166,6 +176,28 @@ export function DriverProfilePage() {
       notify('error', getErrorMessage(cause))
     } finally {
       setStatusBusy(false)
+    }
+  }
+
+  const handleArchive = async () => {
+    if (!driver || archiveBusy || statusBusy) return
+    const confirmed = window.confirm(
+      `راننده «${driver.full_name}» با شماره مسلسل ${driver.driver_code} آرشیف شود؟`,
+    )
+    if (!confirmed) return
+
+    setArchiveBusy(true)
+    setArchiveError(null)
+    try {
+      await archiveDriver(driver.id)
+      notify('success', `راننده «${driver.full_name}» آرشیف شد.`)
+      navigate('/drivers', { replace: true })
+    } catch (cause) {
+      const message = getErrorMessage(cause)
+      setArchiveError(message)
+      notify('error', message)
+    } finally {
+      setArchiveBusy(false)
     }
   }
 
@@ -219,62 +251,139 @@ export function DriverProfilePage() {
           بازگشت به فهرست رانندگان
         </Link>
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <Link
-            to={`/drivers/${driver.id}/edit`}
-            className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"
-          >
-            <PencilIcon className="size-4" />
-            ویرایش اطلاعات
-          </Link>
-          <Link
-            to={`/financial/payments/new?driver_id=${driver.id}`}
-            className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"
-          >
-            <CreditCardIcon className="size-4" />
-            ثبت پرداخت
-          </Link>
-          <Button
-            variant={driver.status ? 'danger' : 'success'}
-            loading={statusBusy}
-            onClick={handleToggle}
-            icon={<PowerIcon className="size-4" />}
-          >
-            {driver.status ? 'غیرفعال کردن راننده' : 'فعال کردن راننده'}
-          </Button>
+          {canManage && (
+            <>
+              <Link
+                to={`/drivers/${driver.id}/edit`}
+                className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-xs transition hover:border-slate-300 hover:bg-slate-50"
+              >
+                <PencilIcon className="size-4" />
+                ویرایش اطلاعات
+              </Link>
+              <Link
+                to={`/financial/payments/new?driver_id=${driver.id}`}
+                className="inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-gradient-to-b from-brand-500 to-brand-600 px-4 text-sm font-semibold text-white shadow-sm shadow-brand-600/25 transition-all duration-150 hover:from-brand-500 hover:to-brand-700 hover:shadow-md active:translate-y-px"
+              >
+                <CreditCardIcon className="size-4" />
+                ثبت پرداخت جدید
+              </Link>
+              <Button
+                variant={driver.status ? 'danger' : 'success'}
+                loading={statusBusy}
+                onClick={handleToggle}
+                icon={<PowerIcon className="size-4" />}
+              >
+                {driver.status ? 'غیرفعال کردن راننده' : 'فعال کردن راننده'}
+              </Button>
+              <Button
+                variant="danger"
+                loading={archiveBusy}
+                disabled={statusBusy}
+                onClick={handleArchive}
+                icon={<ArchiveIcon className="size-4" />}
+              >
+                آرشیف راننده
+              </Button>
+            </>
+          )}
           <Button variant="secondary" size="sm" onClick={handleReload} icon={<RefreshIcon className="size-4" />}>
             بازخوانی
           </Button>
         </div>
       </div>
+      {archiveError && (
+        <p
+          className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"
+          role="alert"
+        >
+          آرشیف راننده انجام نشد: {archiveError}
+        </p>
+      )}
 
       <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-        <div className="h-24 bg-gradient-to-l from-slate-900 via-slate-800 to-slate-700" />
-        <div className="px-5 pb-6 sm:px-6">
-          <div className="-mt-12 flex flex-wrap items-end justify-between gap-4">
-            <div className="flex flex-wrap items-end gap-4">
+        <div className="relative isolate overflow-hidden border-b border-[#bfece8] bg-gradient-to-br from-[#D9F7F5] via-[#effbfc] to-[#e8f4ff]">
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 overflow-hidden"
+          >
+            <div className="absolute inset-y-0 right-0 w-1.5 bg-gradient-to-b from-[#16B8B0]/70 to-[#087F8C]/20" />
+            <div className="absolute -right-16 -top-28 size-64 rounded-full border border-white/70" />
+            <div className="absolute -right-3 -top-16 size-44 rounded-full border border-[#16B8B0]/15" />
+            <div className="absolute -bottom-20 left-[28%] h-40 w-72 rotate-[-12deg] rounded-full border-[18px] border-white/35" />
+            <div className="absolute inset-y-0 left-0 w-1/3 bg-gradient-to-r from-[#16B8B0]/10 to-transparent" />
+          </div>
+
+          <div
+            dir="rtl"
+            className="relative grid gap-4 px-4 py-4 sm:px-6 sm:py-5 lg:grid-cols-[minmax(0,1fr)_minmax(28rem,1.2fr)] lg:items-center lg:px-7"
+          >
+            <div className="flex min-w-0 items-center gap-4 sm:gap-5">
               <DriverAvatar
                 src={driver.photo_url}
                 name={driver.full_name}
-                className="size-24 rounded-2xl border-4 border-white text-2xl shadow-md"
+                className="size-20 rounded-2xl border-4 border-white text-2xl shadow-lg ring-1 ring-[#087F8C]/10 sm:size-24 sm:rounded-3xl sm:text-3xl"
               />
-              <div className="pb-1">
-                <h1 className="text-xl font-bold text-slate-900 sm:text-2xl">
+              <div className="min-w-0">
+                <p className="mb-1 text-xs font-semibold tracking-wide text-[#087F8C]">
+                  پروفایل راننده
+                </p>
+                <h1 className="break-words text-2xl font-bold leading-tight text-[#172B3A] sm:text-3xl">
                   {driver.full_name}
                 </h1>
-                <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-sm text-slate-500">
-                  <span className="font-mono text-xs" dir="ltr">
-                    {driver.driver_code}
-                  </span>
-                  <span className="size-1 rounded-full bg-slate-300" />
-                  <span className="font-mono text-xs" dir="ltr">
-                    {driver.plate_number}
-                  </span>
-                  <StatusBadge active={driver.status} />
-                </div>
               </div>
             </div>
-          </div>
 
+            <dl className="grid gap-2 sm:grid-cols-3">
+              <div className="min-w-0 rounded-xl border border-white/80 bg-white/75 px-3 py-2.5 shadow-sm backdrop-blur-sm">
+                <dt className="text-[11px] font-medium text-slate-500">
+                  شماره مسلسل
+                </dt>
+                <dd
+                  className="mt-1 truncate text-right text-sm font-semibold text-[#172B3A]"
+                  dir="ltr"
+                >
+                  {driver.driver_code}
+                </dd>
+              </div>
+              <div className="min-w-0 rounded-xl border border-white/80 bg-white/75 px-3 py-2.5 shadow-sm backdrop-blur-sm">
+                <dt className="text-[11px] font-medium text-slate-500">
+                  شماره تذکره
+                </dt>
+                <dd
+                  className="mt-1 truncate text-right text-sm font-semibold text-[#172B3A]"
+                  dir="ltr"
+                >
+                  {driver.tazkira_number || 'ثبت نشده'}
+                </dd>
+              </div>
+              <div className="rounded-xl border border-white/80 bg-white/75 px-3 py-2.5 shadow-sm backdrop-blur-sm">
+                <dt className="text-[11px] font-medium text-slate-500">
+                  وضعیت راننده
+                </dt>
+                <dd className="mt-1">
+                  <span
+                    className={cn(
+                      'inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-xs font-semibold',
+                      driver.status
+                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                        : 'border-rose-200 bg-rose-50 text-rose-700',
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        'size-1.5 rounded-full',
+                        driver.status ? 'bg-emerald-500' : 'bg-rose-500',
+                      )}
+                    />
+                    {driver.status ? 'فعال' : 'غیرفعال'}
+                  </span>
+                </dd>
+              </div>
+            </dl>
+          </div>
+        </div>
+
+        <div className="px-5 pb-6 sm:px-6">
           <div
             className={cn(
               'mt-5 flex items-start gap-2 rounded-lg border px-3 py-2.5 text-xs leading-5',
@@ -364,43 +473,45 @@ export function DriverProfilePage() {
                 <CreditCardIcon className="size-4 text-slate-400" />
                 وضعیت مالی
               </h2>
-              <Link
-                to={`/financial/payments/new?driver_id=${driver.id}`}
-                className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-600 transition hover:text-slate-900"
-              >
-                <ArrowRightIcon className="size-4" />
-                ثبت پرداخت جدید
-              </Link>
+              {canManage && (
+                <Link
+                  to={`/financial/payments/new?driver_id=${driver.id}`}
+                  className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg bg-gradient-to-b from-brand-500 to-brand-600 px-3 text-xs font-semibold text-white shadow-sm shadow-brand-600/25 transition-all duration-150 hover:from-brand-500 hover:to-brand-700 active:translate-y-px"
+                >
+                  <CreditCardIcon className="size-4" />
+                  ثبت پرداخت جدید
+                </Link>
+              )}
             </div>
 
             <div className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-              <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+              <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-xs">
                 <p className="text-xs font-medium text-slate-500">بدهی دوره جاری</p>
                 <p className="mt-1 text-lg font-bold text-slate-900" dir="ltr">
                   {toPersianDigits(financial?.current_obligation || '0')} AFN
                 </p>
               </div>
-              <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+              <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-xs">
                 <p className="text-xs font-medium text-slate-500">بدهی معوق</p>
                 <p className="mt-1 text-lg font-bold text-rose-600" dir="ltr">
                   {toPersianDigits(financial?.overdue_debt || '0')} AFN
                 </p>
               </div>
-              <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+              <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-xs">
                 <p className="text-xs font-medium text-slate-500">مجموع بدهی</p>
                 <p className="mt-1 text-lg font-bold text-slate-900" dir="ltr">
                   {toPersianDigits(financial?.driver_total_balance || '0')} AFN
                 </p>
               </div>
-              <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+              <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-xs">
                 <p className="text-xs font-medium text-slate-500">اعتبار موجود</p>
                 <p className="mt-1 text-lg font-bold text-emerald-600" dir="ltr">
                   {toPersianDigits(financial?.available_credit || '0')} AFN
                 </p>
               </div>
-              <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+              <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-xs">
                 <p className="text-xs font-medium text-slate-500">دریافت نقدی</p>
-                <p className="mt-1 text-lg font-bold text-blue-600" dir="ltr">
+                <p className="mt-1 text-lg font-bold text-brand-600" dir="ltr">
                   {toPersianDigits(financial?.cash_received || '0')} AFN
                 </p>
               </div>
@@ -470,7 +581,15 @@ export function DriverProfilePage() {
             </div>
           </section>
 
-          <DriverPeriodPayments coverage={periodCoverage} />
+          <DriverPeriodPayments
+            coverage={periodCoverage}
+            driverId={driver.id}
+            canManage={canManage}
+          />
+          <DriverPaymentHistory driverId={driver.id} canManage={canManage} />
+          <DriverDocumentsErrorBoundary>
+            <DriverDocumentsSection driverId={driver.id} canManage={canManage} />
+          </DriverDocumentsErrorBoundary>
 
           <div className="mt-6 flex flex-wrap gap-x-6 gap-y-1 border-t border-slate-100 pt-4 text-[11px] text-slate-400">
             <span>تاریخ ایجاد: {formatKabulDateTime(driver.created_at)}</span>

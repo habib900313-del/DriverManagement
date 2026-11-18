@@ -4,6 +4,7 @@ import { ArrowRightIcon, CalendarIcon, CreditCardIcon, RefreshIcon } from '../co
 import { StatusBadge } from '../components/ui/Badge'
 import { Button, LinkButton } from '../components/ui/Button'
 import { EmptyState } from '../components/ui/EmptyState'
+import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
 import {
   fetchDriver,
@@ -15,6 +16,8 @@ import { getErrorMessage, isAbortError } from '../lib/errors'
 import type { Driver } from '../types/driver'
 
 export function DriverFinancialPage() {
+  const { user } = useAuth()
+  const canManage = Boolean(user?.is_staff || user?.is_superuser)
   const { id } = useParams()
   const driverId = Number(id)
   const [driver, setDriver] = useState<Driver | null>(null)
@@ -123,18 +126,20 @@ export function DriverFinancialPage() {
         <div className="flex flex-wrap items-center gap-2">
           <Link
             to={`/drivers/${driver.id}`}
-            className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"
+            className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-xs transition hover:border-slate-300 hover:bg-slate-50"
           >
             <CalendarIcon className="size-4" />
             مشاهده پروفایل
           </Link>
-          <LinkButton
-            to={`/financial/payments/new?driver_id=${driver.id}`}
-            className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"
-            icon={<CreditCardIcon className="size-4" />}
-          >
-            ثبت پرداخت
-          </LinkButton>
+          {canManage && (
+            <LinkButton
+              to={`/financial/payments/new?driver_id=${driver.id}`}
+              className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-xs transition hover:border-slate-300 hover:bg-slate-50"
+              icon={<CreditCardIcon className="size-4" />}
+            >
+              ثبت پرداخت
+            </LinkButton>
+          )}
         </div>
       </div>
 
@@ -167,7 +172,7 @@ export function DriverFinancialPage() {
         </div>
         <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
           <p className="text-sm font-medium text-slate-500">اعتبار قابل استفاده</p>
-          <p className="mt-2 text-2xl font-bold tracking-tight text-blue-600" dir="ltr">
+          <p className="mt-2 text-2xl font-bold tracking-tight text-brand-600" dir="ltr">
             {toPersianDigits(summary.available_credit)} AFN
           </p>
         </div>

@@ -48,7 +48,7 @@ export function Pagination({
           type="button"
           onClick={() => onChange(page - 1)}
           disabled={page <= 1}
-          className="inline-flex size-8 items-center justify-center rounded-lg border border-slate-200 text-slate-600 transition hover:bg-slate-50 disabled:pointer-events-none disabled:opacity-40"
+          className="inline-flex size-8 items-center justify-center rounded-lg border border-slate-200 text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 disabled:pointer-events-none disabled:opacity-40"
           aria-label="صفحه قبلی"
         >
           <ChevronRightIcon className="size-4" />
@@ -71,8 +71,8 @@ export function Pagination({
               className={cn(
                 'inline-flex size-8 items-center justify-center rounded-lg text-xs font-medium transition',
                 item === page
-                  ? 'bg-slate-900 text-white'
-                  : 'border border-slate-200 text-slate-600 hover:bg-slate-50',
+                  ? 'bg-gradient-to-b from-brand-500 to-brand-600 text-white shadow-sm shadow-brand-600/25'
+                  : 'border border-slate-200 text-slate-600 hover:border-slate-300 hover:bg-slate-50',
               )}
             >
               {toPersianDigits(item)}
@@ -84,7 +84,7 @@ export function Pagination({
           type="button"
           onClick={() => onChange(page + 1)}
           disabled={page >= totalPages}
-          className="inline-flex size-8 items-center justify-center rounded-lg border border-slate-200 text-slate-600 transition hover:bg-slate-50 disabled:pointer-events-none disabled:opacity-40"
+          className="inline-flex size-8 items-center justify-center rounded-lg border border-slate-200 text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 disabled:pointer-events-none disabled:opacity-40"
           aria-label="صفحه بعدی"
         >
           <ChevronLeftIcon className="size-4" />

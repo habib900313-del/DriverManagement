@@ -60,7 +60,7 @@
 | D8 | reversalها **ردیف append-only جدید**؛ اصل mutate نمی‌شود؛ فیلد `reversal_at` روی اصل وجود ندارد؛ reversalها terminalاند | رفع E5 |
 | D9 | پشته تعهدات Own-First (§۵)؛ cap انتقال: `R ≤ remaining_Ti`؛ این خودکار `Σ reversals ≤ original.amount` را نیز پوشش می‌دهد | اصلاح T5؛ قاعده aggregate ناکافی/غلط بود |
 | D10 | capهای نوشتنی: transfer/waiver `≤ source_balance`؛ consumption `≤ MIN(source_available, target_need)` **پیش از INSERT** | رفع E2/E3 |
-| D11 | تقسیم اضافه‌پرداخت **در لحظه نوشتن و در همان transaction** (مثلاً 700 → 600 fee + 100 credit)؛ اعتبار یک‌بار متولد می‌شود | رفع E1 |
+| D11 | دریافت جدید از دوره هدف آغاز و به‌ترتیب میان مانده‌های دوره‌های متوالی (با احتساب بدهی انتقال‌یافته) تا تخصیص کامل تقسیم می‌شود؛ `CREDIT` جدید ساخته نمی‌شود. اعتبارهای تاریخی و اعتبار حاصل از W9/W5-ext حفظ می‌شوند | تخصیص خودکار بدون حذف سابقه |
 | D12 | اصلاح allocation با مصرف وابسته = W5-ext (§۷): reverse مصرف‌ها → reverse منبع → جایگزین‌ها → **تأیید مجدد مدیر**؛ سوئیچ هم‌روز as-of | بدون تکرار/گمشدگی |
 | D13 | گردش کار W9 (un-settle سپس reversal) وقتی ظرفیت reversal مقصد صفر است | رفع E4/P1 |
 | D14 | معادلات پایستگی (O)/(C)/(S) (§۶)؛ ادعای «ثبات بدهی هنگام تسویه نقدی» **باطل و منسوخ** است | اصلاح N4 |
@@ -72,7 +72,7 @@
 
 | # | تصمیم | دلیل |
 |---|---|---|
-| T1 | الگوی touch → validate → insert داخل `transaction.atomic()`؛ `select_for_update()` استفاده نمی‌شود | SQLite تک‌نویسنده؛ FOR UPDATE no-op است |
+| T1 | الگوی validate → insert داخل `transaction.atomic()`؛ برای سقف تجمیعی Refund، ردیف Payment با `select_for_update()` قفل می‌شود تا درخواست‌های هم‌زمان نتوانند از سقف عبور کنند | SQLite این قفل را نادیده می‌گیرد؛ PostgreSQL آن را اعمال می‌کند |
 | T2 | دفاع عمقی: triggerهای `BEFORE INSERT/UPDATE` با `RunSQL` برای invariantهای aggregate + `CheckConstraint` برای row-level | invariant حیاتی حتی با SQL خام نقض‌ناپذیر |
 | T3 | قرارداد **تمام‌AFN** (validator) | SUMهای SQLite دقیقاً integer؛ بدون خطای شناور |
 | T4 | `idempotency_key` / `consumption_id` یکتا | retry امن |
@@ -91,19 +91,21 @@
 Driver (موجود، بدون تغییر ساختاری)
   │ 1───N  DriverFeeHistory        (drivers app — eraهای fee_start_date، append-only)
   │ 1───N  Payment                 (payments app)
-               │ 1───N  PaymentAllocation  (fee_period | credit)
+               │ 1───N  PaymentAllocation  (fee_period | credit؛ اعتبارهای تاریخی و بازتخصیص‌های اصلاحی)
+               │ 1───N  PaymentRefund      (برگشت نقد مستقل و append-only)
                │             │ 1───N  AllocationConsumption  (فقط از منبع credit)
                │ self-FK: correction_of → پرداخت اصلی (روی پرداخت جدید)
                │ PaymentAllocation.self-FK: correction_of → allocation اصلی
+               │ PaymentRefund ← refunded_by / refund_date / reason
   Adjustment (payments app — waiver | transfer | waiver_reversal | transfer_reversal)
                │ self-FK: reverses_adjustment → adjustment اصلی
   FeeSchedule  (payments app — مبلغ فیس جهانی، append-only)
 
 User (django.contrib.auth.User) ← created_by/allocated_by/consumed_by/reversed_by/
-                                    voided_by/corrected_by/changed_by (همه PROTECT)
+                                    voided_by/corrected_by/refunded_by/changed_by (همه PROTECT)
 ```
 
-**اصل معماری:** پول نقد فقط در `Payment` خلق می‌شود. `PaymentAllocation` ادعای جهت‌دار روی همان نقد است (جمع active ≤ مبلغ). `AllocationConsumption` ادعا را از استخر credit به دوره منتقل می‌کند — پولی خلق نمی‌کند. `Adjustment` فقط بدهی را جابه‌جا/می‌بخشد — هرگز نقد نمی‌سازد. دوره‌ها محاسبه می‌شوند، ذخیره نمی‌شوند.
+**اصل معماری:** پول نقد فقط در `Payment` خلق می‌شود. `PaymentRefund` آن را با یک رکورد منفی مستقل کاهش می‌دهد؛ `Payment` تغییر نمی‌کند. `PaymentAllocation` ادعای جهت‌دار روی همان نقد است (جمع active ≤ مبلغ خالص پس از Refund). `AllocationConsumption` ادعا را از استخر credit به دوره منتقل می‌کند — پولی خلق نمی‌کند. `Adjustment` فقط بدهی را جابه‌جا/می‌بخشد — هرگز نقد نمی‌سازد. دوره‌ها محاسبه می‌شوند، ذخیره نمی‌شوند.
 
 ---
 
@@ -183,6 +185,20 @@ User (django.contrib.auth.User) ← created_by/allocated_by/consumed_by/reversed
 | reason | TextField غیرخالی؛ created_by FK(User, PROTECT)؛ created_at auto_now_add |
 
 Append-only؛ UPDATE/DELETE ممنوع. ردیف اولیه در data migration با `effective_from = 1900-01-01`.
+
+### ۴.۶ PaymentRefund
+
+| فیلد | نوع / قید |
+|---|---|
+| payment | FK(Payment, PROTECT, related_name=`refunds`) |
+| amount | DecimalField(10,2)، `> 0`؛ تمام-AFN |
+| refund_date | DateField — تاریخ واقعی برگشت نقد، بدون تاریخ آینده |
+| effective_date | DateField — روز ثبت Refund در Ledger، بدون backdate |
+| reason | TextField غیرخالی |
+| refunded_by | FK(User, PROTECT) |
+| created_at | auto_now_add |
+
+رکورد Refund مستقل و append-only است. سقف تجمیعی: `SUM(refunds.amount) ≤ payment.amount`. Refund در transaction، ابتدا مقدار unallocated را کاهش می‌دهد و سپس allocationهای لازم را با reversal و ردیف‌های جایگزین بازسازی می‌کند؛ برای credit، مصرف‌های وابسته فقط تا موجودی و نیاز معتبر دوباره ثبت می‌شوند. Refund با void/correction روی همان پرداخت ترکیب نمی‌شود.
 
 ### ۴.۶ DriverFeeHistory (`apps.drivers`)
 
@@ -292,7 +308,7 @@ driver_total_balance       = Σ period_balance(همه دوره‌های بازس
 
 | # | عملیات | گام‌ها |
 |---|---|---|
-| W1 | **دریافت + تقسیم** | touch Driver → validate → INSERT Payment → `fee_alloc = MIN(amount, balance(target))` (مدیر انتخاب می‌کند؛ FIFO فقط پیشنهاد) → `credit_alloc = amount − fee_alloc` → INSERT هر دو allocation در **همان transaction** → trigger جمع. excess فقط یک‌بار متولد می‌شود (D11) |
+| W1 | **دریافت + تقسیم** | touch Driver → validate → INSERT Payment → از دوره هدف به‌ترتیب تا سقف `balance(period)` شامل بدهی انتقال‌یافته تخصیص می‌یابد؛ دوره‌های متوالی در صورت نیاز تولید می‌شوند تا تمام مبلغ در همان transaction تخصیص یابد. دریافت جدید `CREDIT` نمی‌سازد (D11) |
 | W2 | **مصرف اعتبار** | touch Payment منبع → خواندن `source_available` و `target_balance` → `amount ≤ MIN` وگرنه REJECT → INSERT consumption با `consumed_by = مدیر` (C5) |
 | W3 | **ابطال پرداخت** | status=`voided` + voided_at/by/reason → reverse همه allocationهای active → reverse همه consumptionهای آن‌ها — **همه با timestamp یکسان `now`**، یک transaction. هیچ DELETE |
 | W4 | **اصلاح پرداخت (مبلغ/راننده)** — جدا از W5 (C9) | اصل: status=`corrected` + corrected_at/reason + reverse فرزندان → Payment **جدید** با `correction_of=اصل`، `payment_date=تاریخ واقعی نقد`، `effective_date=روز correction` + allocationهای جدید (effective=روز correction). revenue فقط جدید را می‌شمارد |
@@ -301,8 +317,9 @@ driver_total_balance       = Σ period_balance(همه دوره‌های بازس
 | W6 | **waiver** | `amount ≤ source_balance` وگرنه REJECT → INSERT adjustment |
 | W7 | **انتقال** | `T ≤ source_balance` وگرنه REJECT → INSERT transfer |
 | W8 | **reversal waiver/transfer** | `Σ previous + R ≤ original.amount`؛ برای transfer اضافه: **`R ≤ remaining_Ti` (پشته)** وگرنه REJECT با پیام هدایت‌گر → INSERT ردیف reversal append-only |
-| W9 | **un-settle سپس reversal** (وقتی W8 رد شد) | reverse allocation(های) تسویه مقصد → allocation مجدد فقط فیس خود مقصد → مانده آزادشده به credit allocation تحت **همان پرداخت اصلی** (قابل ردیابی) → سپس W8. proof: §۱۱-N4 |
+| W9 | **un-settle سپس reversal** (وقتی W8 رد شد) | reverse allocation(های) تسویه مقصد → تخصیص مجدد فقط فیس خود مقصد → W8 در همان transaction → بازتخصیص مانده آزادشده به credit allocation تحت **همان پرداخت اصلی** (قابل ردیابی؛ سابقه است، نه دریافت جدید). credit باید پس از reversal ساخته شود تا مانده انتقال را دوباره تسویه نکند. proof: §۱۱-N4 |
 | W10 | **تغییر fee_start_date** | endpoint اختصاصی → محاسبه effective (§۸.۳) → INSERT DriverFeeHistory + UPDATE Driver.fee_start_date، اتمیک |
+| W11 | **Refund جزئی/کامل پرداخت** | `PaymentRefund` مستقل با مبلغ/تاریخ/دلیل/کاربر؛ سقف مجموع Refundها = مبلغ پرداخت؛ allocationهای تغییرکرده با reversal و ردیف جایگزین بازسازی می‌شوند؛ درآمد خالص و بدهی دوره از تاریخ effective محاسبه می‌شوند |
 | W11 | **تغییر مبلغ فیس** | INSERT FeeSchedule با `effective_from ≥ today`. چیز دیگری لمس نمی‌شود |
 
 ---
@@ -459,8 +476,8 @@ gross بعد = 1000 (تاریخی، بی‌ضرر)؛ active = 700 ≤ 700 ✓؛ 
 | 3 settle P2 با 900 | 300 | 900 | 0 | 900 | 0 | 0 | 0 |
 | 4 تلاش R=300 | REJECT (T_rem=0) | — | — | — | — | — | — |
 | 5 W9 reverse allocation | 1200 | 0 | 0 | 900 | 0 | 0 | 900 |
-| 6 split 600 fee + 300 credit | 600 (300/300) | 600 | 0 | 900 | 300 | 0 | 0 |
-| 7 R=300 (T_rem=300 ✓) | 600 (600/0) | 600 | 0 | 900 | 300 | 0 | 0 |
+| 6 W9 بازتخصیص 600 fee و reversal انتقال | 600 (600/0) | 600 | 0 | 900 | 0 | 0 | 300 |
+| 7 بازتخصیص 300 باقی‌مانده به credit | 600 (600/0) | 600 | 0 | 900 | 300 | 0 | 0 |
 | 8 consume 300→P1 | 300 | 600 | 300 | 900 | 0 | 300 | 0 |
 
 (O) و (C) در هر ۸ مرحله برقرار؛ مرحله 8 درآمد همچنان 900 ✓.

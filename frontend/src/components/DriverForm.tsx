@@ -20,17 +20,24 @@ import {
   ApiError,
   checkDriverUnique,
   createDriver,
-  receivePayment,
   uploadDocuments,
   updateDriver,
 } from '../lib/api'
 import { cn } from '../lib/cn'
-import { todayIsoKabul } from '../lib/dates'
+import {
+  formatGregorianShort,
+  formatJalaliLong,
+  isValidIsoDate,
+  isValidJalaliQuarterPeriod,
+  jalaliQuarterEnd,
+  todayIsoKabul,
+} from '../lib/dates'
 import { getErrorMessage, normalizeDigits } from '../lib/errors'
 import type { Driver, DriverField, DriverPayload } from '../types/driver'
 
 type FormValues = Omit<DriverPayload, 'photo' | 'documents'>
 type FormErrors = Partial<Record<DriverField, string>>
+type InitialPaymentErrors = Partial<Record<'amount' | 'date' | 'periodStart', string>>
 
 interface DriverFormProps {
   mode: 'create' | 'edit'
@@ -57,7 +64,10 @@ function initialValues(driver?: Driver): FormValues {
   }
 }
 
-function validate(values: FormValues): FormErrors {
+function validate(
+  values: FormValues,
+  requireRegistrationDetails: boolean,
+): FormErrors {
   const errors: FormErrors = {}
 
   if (!values.driver_code.trim()) {
@@ -65,6 +75,17 @@ function validate(values: FormValues): FormErrors {
   }
   if (!values.full_name.trim()) {
     errors.full_name = 'نام کامل الزامی است.'
+  }
+  if (requireRegistrationDetails) {
+    if (!values.father_name.trim()) {
+      errors.father_name = 'نام پدر الزامی است.'
+    }
+    if (!values.phone.trim()) {
+      errors.phone = 'شماره تماس الزامی است.'
+    }
+    if (!values.tazkira_number.trim()) {
+      errors.tazkira_number = 'شماره تذکره الزامی است.'
+    }
   }
   if (!values.plate_number.trim()) {
     errors.plate_number = 'پلیت موتر الزامی است.'
@@ -117,11 +138,13 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
   // Initial payment state
   const [includeInitialPayment, setIncludeInitialPayment] = useState(false)
   const [initialPaymentAmount, setInitialPaymentAmount] = useState('')
-  const [initialPaymentPeriod, setInitialPaymentPeriod] = useState<{
-    start: string
-    end: string
-  } | null>(null)
-  const [initialPaymentDate, setInitialPaymentDate] = useState('')
+  const [initialPaymentPeriodStart, setInitialPaymentPeriodStart] = useState('')
+  const initialPaymentPeriodEnd = initialPaymentPeriodStart
+    ? jalaliQuarterEnd(initialPaymentPeriodStart)
+    : null
+  const [initialPaymentDate, setInitialPaymentDate] = useState(todayIsoKabul)
+  const [initialPaymentErrors, setInitialPaymentErrors] =
+    useState<InitialPaymentErrors>({})
   const [initialPaymentIdempotencyKey, setInitialPaymentIdempotencyKey] = useState<string | null>(null)
 
   const setValue = (key: keyof FormValues, value: string | boolean) => {
@@ -180,7 +203,7 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
     event.preventDefault()
     if (submitting) return
 
-    const clientErrors = validate(values)
+    const clientErrors = validate(values, !isEdit)
     setErrors(clientErrors)
     setFormError(null)
 
@@ -189,10 +212,51 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
       return
     }
 
+    if (!isEdit && includeInitialPayment) {
+      const paymentErrors: InitialPaymentErrors = {}
+      const amount = normalizeDigits(initialPaymentAmount).trim()
+
+      if (!/^\d+$/.test(amount)) {
+        paymentErrors.amount = 'مبلغ پرداخت باید یک عدد صحیح یا صفر باشد.'
+      }
+      if (/^\d+$/.test(amount) && Number(amount) > 0) {
+        if (!isValidIsoDate(initialPaymentDate)) {
+          paymentErrors.date = 'تاریخ پرداخت را از تقویم انتخاب کنید.'
+        } else if (initialPaymentDate > todayIsoKabul()) {
+          paymentErrors.date = 'تاریخ پرداخت نمی‌تواند در آینده باشد.'
+        }
+        if (!initialPaymentPeriodStart) {
+          paymentErrors.periodStart = 'تاریخ شروع دوره را انتخاب کنید.'
+        }
+        if (
+          initialPaymentPeriodStart &&
+          initialPaymentPeriodEnd &&
+          !isValidJalaliQuarterPeriod(
+            values.fee_start_date,
+            initialPaymentPeriodStart,
+            initialPaymentPeriodEnd,
+          )
+        ) {
+          paymentErrors.periodStart =
+            'این تاریخ شروع با دوره‌های سه‌ماهه شمسی بر اساس تاریخ شروع فیس مطابقت ندارد.'
+        }
+      }
+      setInitialPaymentErrors(paymentErrors)
+      if (Object.keys(paymentErrors).length > 0) {
+        notify('error', 'اطلاعات پرداخت اولیه را بررسی کنید.')
+        return
+      }
+    }
+
     if (unique.codeTaken || unique.plateTaken) {
       notify('error', 'شماره مسلسل یا پلیت وارد شده قبلاً ثبت شده است.')
       return
     }
+
+    const initialPaymentRequested =
+      !isEdit &&
+      includeInitialPayment &&
+      Number(normalizeDigits(initialPaymentAmount).trim()) > 0
 
     setSubmitting(true)
     try {
@@ -216,6 +280,20 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
       }
 
       const payload: DriverPayload = { ...values, photo }
+      if (initialPaymentRequested && initialPaymentPeriodStart) {
+        const idempotencyKey =
+          initialPaymentIdempotencyKey ?? crypto.randomUUID()
+        if (!initialPaymentIdempotencyKey) {
+          setInitialPaymentIdempotencyKey(idempotencyKey)
+        }
+        payload.initial_payment_amount = normalizeDigits(
+          initialPaymentAmount,
+        ).trim()
+        payload.initial_payment_date = initialPaymentDate
+        payload.initial_payment_period_start = initialPaymentPeriodStart
+        payload.initial_payment_idempotency_key = idempotencyKey
+      }
+
       let saved: any
       if (isEdit) {
         saved = await updateDriver(driver!.id, payload)
@@ -233,37 +311,20 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
         }
       }
 
-      // Process initial payment if enabled
-      let paymentError: string | null = null
-      if (!isEdit && includeInitialPayment && initialPaymentAmount && initialPaymentPeriod) {
-        try {
-          await receivePayment({
-            driver_id: saved.id,
-            amount: initialPaymentAmount,
-            payment_date: initialPaymentDate,
-            target_period_start: initialPaymentPeriod.start,
-            target_period_end: initialPaymentPeriod.end,
-            idempotency_key: initialPaymentIdempotencyKey ?? undefined,
-          })
-        } catch (cause) {
-          paymentError = getErrorMessage(cause)
-        }
-      }
-
       if (docError) {
         notify('error', `راننده ثبت شد، اما در آپلود اسناد خطایی رخ داد: ${docError}`)
       }
-      if (paymentError) {
-        notify('error', `راننده ثبت شد، اما در ثبت پرداخت خطایی رخ داد: ${paymentError}`)
-      }
-      if (!docError && !paymentError) {
+      if (!docError) {
+        const completedActions = []
+        if (documents.length > 0) {
+          completedActions.push(`${documents.length} سند آپلود شد`)
+        }
+        if (initialPaymentRequested) completedActions.push('پرداخت ثبت شد')
         notify(
           'success',
           isEdit
             ? 'تغییرات راننده با موفقیت ذخیره شد.'
-            : documents.length > 0 || includeInitialPayment
-              ? `راننده جدید با موفقیت ثبت شد${documents.length > 0 ? ` و ${documents.length} سند آپلود شد` : ''}${includeInitialPayment && documents.length > 0 ? ' و پرداخت ثبت شد' : includeInitialPayment ? ' و پرداخت ثبت شد' : ''}.`
-              : 'راننده جدید با موفقیت ثبت شد.',
+            : `راننده جدید با موفقیت ثبت شد${completedActions.length ? ` و ${completedActions.join(' و ')}` : ''}.`,
         )
       }
       navigate(`/drivers/${saved.id}`, { replace: isEdit })
@@ -271,13 +332,24 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
       setPhotoError(undefined)
       if (cause instanceof ApiError) {
         const mapped: FormErrors = {}
+        const paymentFieldMap: Record<string, keyof InitialPaymentErrors> = {
+          initial_payment_amount: 'amount',
+          initial_payment_date: 'date',
+          initial_payment_period_start: 'periodStart',
+        }
         for (const [key, messages] of Object.entries(cause.fieldErrors)) {
           const message = messages?.[0]
           if (!message) continue
+          const paymentField = paymentFieldMap[key]
           if (key === 'photo') {
             setPhotoError(message)
           } else if (key === 'non_field_errors' || key === 'detail') {
             setFormError(message)
+          } else if (paymentField) {
+            setInitialPaymentErrors((current) => ({
+              ...current,
+              [paymentField]: message,
+            }))
           } else {
             mapped[key as DriverField] = message
           }
@@ -386,12 +458,14 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
           <Field
             label="نام پدر"
             htmlFor="father_name"
+            required={!isEdit}
             error={fieldError('father_name')}
           >
             <input
               id="father_name"
-              value={values.father_name ?? ''}
+              value={values.father_name}
               onChange={(event) => setValue('father_name', event.target.value)}
+              required={!isEdit}
               autoComplete="off"
               aria-invalid={Boolean(fieldError('father_name'))}
               className={inputClass}
@@ -401,13 +475,15 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
           <Field
             label="شماره تماس"
             htmlFor="phone"
+            required={!isEdit}
             error={fieldError('phone')}
             hint="مثال: 0700123456 — متن مجاز است، عددی ذخیره نمی‌شود."
           >
             <input
               id="phone"
-              value={values.phone ?? ''}
+              value={values.phone}
               onChange={(event) => setValue('phone', event.target.value)}
+              required={!isEdit}
               dir="ltr"
               inputMode="tel"
               autoComplete="off"
@@ -419,14 +495,16 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
           <Field
             label="شماره تذکره"
             htmlFor="tazkira_number"
+            required={!isEdit}
             error={fieldError('tazkira_number')}
           >
             <input
               id="tazkira_number"
-              value={values.tazkira_number ?? ''}
+              value={values.tazkira_number}
               onChange={(event) =>
                 setValue('tazkira_number', event.target.value)
               }
+              required={!isEdit}
               dir="ltr"
               autoComplete="off"
               aria-invalid={Boolean(fieldError('tazkira_number'))}
@@ -493,158 +571,151 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
         </div>
       </SectionCard>
 
-      <SectionCard
-        title="پرداخت اولیه (اختیاری)"
-        description="اگر می‌خواهید در زمان ثبت راننده، یک پرداخت اولیه ثبت کنید، تیک زیر را فعال کنید."
-      >
-        <div className="flex items-center gap-3 mb-3">
-          <input
-            id="include_initial_payment"
-            type="checkbox"
-            checked={includeInitialPayment}
-            onChange={(e) => setIncludeInitialPayment(e.target.checked)}
-            className="rounded border-slate-300 text-slate-600 focus:ring-slate-500"
-          />
-          <label htmlFor="include_initialPayment" className="text-sm font-medium text-slate-700 cursor-pointer">
-            پرداخت اولیه را به ثبت راننده اضافه کن
-          </label>
-        </div>
-
-        <div className={includeInitialPayment ? 'block' : 'hidden'}>
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            <Field
-              label="مبلغ پرداخت اولیه (افغانی)"
-              required
+      {!isEdit && (
+        <div className="space-y-4">
+          {/* کارت فشرده پرداخت اولیه: عنوان + چکباکس در یک ردیف */}
+          <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <label
+              htmlFor="include_initial_payment"
+              className="flex cursor-pointer items-center gap-2.5"
             >
               <input
-                id="initial_payment_amount"
-                type="text"
-                inputMode="numeric"
-                pattern="[0-9]*"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 font-mono dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={initialPaymentAmount}
-                onChange={(event) => setInitialPaymentAmount(event.target.value)}
-                placeholder="مثلاً 600"
-              />
-            </Field>
-
-            <Field label="تاریخ پرداخت (شمسی)" required>
-              <input
-                id="initial_payment_date"
-                type="text"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={initialPaymentDate}
-                onChange={(event) => setInitialPaymentDate(event.target.value)}
-                placeholder="۱۴۰۵/۰۸/۲۰"
-              />
-            </Field>
-
-            <Field label="دوره finance (اختیاری)">
-              <input
-                id="initial_payment_period_start"
-                type="text"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={initialPaymentPeriod?.start ?? ''}
+                id="include_initial_payment"
+                type="checkbox"
+                checked={includeInitialPayment}
                 onChange={(event) => {
-                  if (initialPaymentPeriod) {
-                    setInitialPaymentPeriod({ ...initialPaymentPeriod, start: event.target.value })
-                  } else {
-                    setInitialPaymentPeriod({ start: event.target.value, end: '' })
-                  }
+                  setIncludeInitialPayment(event.target.checked)
+                  if (!event.target.checked) setInitialPaymentErrors({})
                 }}
-                placeholder="۱۴۰۵/۰۸/۲۰"
+                className="size-4 rounded border-slate-300 text-brand-600 focus:ring-2 focus:ring-brand-500/30"
               />
-              <input
-                id="initial_payment_period_end"
-                type="text"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500 mt-2"
-                defaultValue={initialPaymentPeriod?.end ?? ''}
-                onChange={(event) => {
-                  if (initialPaymentPeriod) {
-                    setInitialPaymentPeriod({ ...initialPaymentPeriod, end: event.target.value })
-                  } else {
-                    setInitialPaymentPeriod({ start: '', end: event.target.value })
-                  }
-                }}
-                placeholder="۱۴۰۵/۱۱/۰۸"
-              />
-            </Field>
-          </div>
+              <span className="text-sm font-semibold text-slate-800">
+                پرداخت اولیه
+              </span>
+            </label>
+
+            {includeInitialPayment && (
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                <Field
+                  label="مبلغ پرداخت اولیه (افغانی)"
+                  htmlFor="initial_payment_amount"
+                  required
+                  error={initialPaymentErrors.amount}
+                >
+                  <input
+                    id="initial_payment_amount"
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9۰-۹٠-٩]*"
+                    className={cn(inputClass, 'font-mono dir-ltr')}
+                    value={initialPaymentAmount}
+                    onChange={(event) => {
+                      setInitialPaymentAmount(event.target.value)
+                      setInitialPaymentErrors((current) => ({
+                        ...current,
+                        amount: undefined,
+                      }))
+                    }}
+                    placeholder="مثلاً ۶۰۰"
+                    aria-invalid={Boolean(initialPaymentErrors.amount)}
+                  />
+                </Field>
+
+                <DualDateInput
+                  id="initial_payment_date"
+                  label="تاریخ پرداخت"
+                  value={initialPaymentDate}
+                  onChange={(value) => {
+                    setInitialPaymentDate(value)
+                    setInitialPaymentErrors((current) => ({
+                      ...current,
+                      date: undefined,
+                    }))
+                  }}
+                  allowGregorian
+                  compact
+                  required
+                  error={initialPaymentErrors.date}
+                />
+              </div>
+            )}
+          </section>
+
+          {/* کارت مستقل: دوره پرداخت + اطلاعات و محاسبات دوره */}
+          {includeInitialPayment && (
+            <SectionCard title="دوره پرداخت">
+              <div className="grid gap-4 md:grid-cols-2">
+                <DualDateInput
+                  id="initial_payment_period_start"
+                  label="تاریخ شروع دوره"
+                  value={initialPaymentPeriodStart}
+                  onChange={(start) => {
+                    setInitialPaymentPeriodStart(start)
+                    setInitialPaymentErrors((current) => ({
+                      ...current,
+                      periodStart: undefined,
+                    }))
+                  }}
+                  required
+                  error={initialPaymentErrors.periodStart}
+                  hint="شروع باید با دوره‌های سه‌ماهه بر اساس تاریخ شروع فیس منطبق باشد."
+                />
+
+                <Field
+                  label="تاریخ پایان دوره"
+                  htmlFor="initial_payment_period_end"
+                  hint="این مقدار فقط‌خواندنی است و خودکار محاسبه می‌شود."
+                >
+                  <input
+                    id="initial_payment_period_end"
+                    readOnly
+                    aria-readonly="true"
+                    value={
+                      initialPaymentPeriodEnd
+                        ? formatJalaliLong(initialPaymentPeriodEnd)
+                        : ''
+                    }
+                    placeholder="پس از انتخاب تاریخ شروع محاسبه می‌شود"
+                    className={cn(inputClass, 'bg-slate-50 text-slate-600')}
+                  />
+                </Field>
+              </div>
+
+              {/* قسمت سوم: اطلاعات و محاسبات دوره */}
+              <div className="mt-5 space-y-3 border-t border-slate-100 pt-5">
+                <h3 className="text-sm font-semibold text-slate-800">
+                  اطلاعات و محاسبات دوره
+                </h3>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600 ring-1 ring-slate-100">
+                    <span className="text-slate-400">شمسی: </span>
+                    <span className="font-medium">
+                      {initialPaymentPeriodEnd
+                        ? formatJalaliLong(initialPaymentPeriodEnd)
+                        : '—'}
+                    </span>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600 ring-1 ring-slate-100">
+                    <span className="text-slate-400">میلادی: </span>
+                    <span className="font-medium" dir="ltr">
+                      {initialPaymentPeriodEnd
+                        ? formatGregorianShort(initialPaymentPeriodEnd)
+                        : '—'}
+                    </span>
+                  </div>
+                </div>
+                <p className="rounded-lg bg-brand-50 px-3 py-2 text-xs font-medium text-brand-700">
+                  مدت دوره: سه ماه
+                </p>
+              </div>
+            </SectionCard>
+          )}
         </div>
-      </SectionCard>
-
-      <SectionCard
-        title="پرداخت اولیه (اختیاری)"
-        description="اگر می‌خواهید در زمان ثبت راننده، یک پرداخت اولیه ثبت شود، تیک زیر را فعال کنید."
-      >
-        <div className="flex items-center gap-3 mb-4">
-          <input
-            id="include_initial_payment"
-            type="checkbox"
-            checked={includeInitialPayment}
-            onChange={(e) => setIncludeInitialPayment(e.target.checked)}
-            className="rounded border-slate-300 bg-slate-50 text-slate-600 focus:ring-slate-500"
-          />
-          <label htmlFor="include_initialPayment" className="text-sm font-medium text-slate-600 cursor-pointer">
-            پرداخت اولیه را به ثبت راننده اضافه کن
-          </label>
-        </div>
-
-        <div className={includeInitialPayment ? 'block' : 'hidden'}>
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            <Field label="مبلغ پرداخت اولیه (افغانی)" required>
-              <input
-                id="initial_payment_amount"
-                type="text"
-                inputMode="numeric"
-                pattern="[0-9]*"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 font-mono dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={initialPaymentAmount}
-                onChange={(event) => setInitialPaymentAmount(event.target.value)}
-                placeholder="مثلاً 600"
-              />
-            </Field>
-
-            <Field label="تاریخ شروع دوره (شمسی)" required>
-              <input
-                id="initial_payment_period_start"
-                type="text"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={initialPaymentPeriod?.start ?? ''}
-                onChange={(e) => {
-                  if (initialPaymentPeriod) {
-                    setInitialPaymentPeriod({ ...initialPaymentPeriod, start: e.target.value })
-                  } else {
-                    setInitialPaymentPeriod({ start: e.target.value, end: '' })
-                  }
-                }}
-                placeholder="۱۴۰۵/۰۸/۲۰"
-              />
-            </Field>
-
-            <Field label="تاریخ پایان دوره (شمسی)" required>
-              <input
-                id="initial_payment_period_end"
-                type="text"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={initialPaymentPeriod?.end ?? ''}
-                onChange={(e) => {
-                  if (initialPaymentPeriod) {
-                    setInitialPaymentPeriod({ ...initialPaymentPeriod, end: e.target.value })
-                  } else {
-                    setInitialPaymentPeriod({ start: '', end: e.target.value })
-                  }
-                }}
-                placeholder="۱۴۰۵/۱۱/۰۸"
-              />
-            </Field>
-          </div>
-        </div>
-      </SectionCard>
+      )}
 
       <SectionCard
         title="عکس و وضعیت"
-        description="عکس به‌صورت محلی و خصوصی ذخیره می‌شود و فقط پس از ورود مدیر قابل مشاهده است."
+        description="عکس به‌عنوان سند راننده در سامانه بارگذاری می‌شود."
       >
         <div className="grid gap-6 lg:grid-cols-[1fr_auto]">
           <PhotoUpload
@@ -697,14 +768,14 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
 
       <SectionCard
         title="اسناد pilotes (PDF)"
-        description="یک یا چند فایل PDF (حداکثر ۱۰ مگابایت هر فایل) آپلود کنید. اسناد فقط از طریق API احراز هویت‌شده قابل دسترسی هستند."
+        description="یک یا چند PDF یا تصویر JPG، PNG یا WebP (حداکثر ۱۰ مگابایت هر فایل) آپلود کنید. اسناد فقط از طریق API احراز هویت‌شده قابل دسترسی هستند."
       >
         <div className="flex flex-col gap-3">
           <div className="flex items-start gap-3">
             <input
               id="documents"
               type="file"
-              accept="application/pdf"
+              accept=".pdf,.jpg,.jpeg,.png,.webp,application/pdf,image/jpeg,image/png,image/webp"
               multiple
               onChange={(event) => {
                 const files = event.target.files
@@ -729,10 +800,10 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
               <p className="text-sm font-medium text-slate-600">
                 {documents.length > 0
                   ? `${documents.length} فایل انتخاب شده`
-                  : 'انتخاب فایل PDF'}
+                  : 'انتخاب PDF یا تصویر'}
               </p>
               <p className="text-xs text-slate-500">
-               PDF — حداکثر ۱۰ مگابایت هر فایل
+                PDF یا JPG، PNG و WebP — حداکثر ۱۰ مگابایت هر فایل
               </p>
             </label>
           </div>
@@ -772,7 +843,7 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
       <div className="flex flex-wrap items-center justify-end gap-2">
         <Link
           to={cancelTo}
-          className="inline-flex h-10 items-center justify-center rounded-lg border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"
+          className="inline-flex h-10 items-center justify-center rounded-xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-xs transition hover:border-slate-300 hover:bg-slate-50"
         >
           انصراف
         </Link>

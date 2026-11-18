@@ -21,6 +21,7 @@ import type { DriverStats } from '../types/driver'
 
 export function DashboardPage() {
   const { user } = useAuth()
+  const canManage = Boolean(user?.is_staff || user?.is_superuser)
   const [stats, setStats] = useState<DriverStats | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -47,22 +48,29 @@ export function DashboardPage() {
       label: 'کل رانندگان',
       value: stats?.total ?? 0,
       icon: UsersIcon,
-      tone: 'bg-slate-900 text-white',
-      ring: 'ring-slate-200',
+      wrapper:
+        'bg-gradient-to-br from-brand-500 to-brand-600 text-white shadow-md shadow-brand-600/25 ring-1 ring-brand-500/30',
+      labelClass: 'text-brand-100',
+      valueClass: 'text-white',
+      iconWrap: 'bg-white/15 text-white ring-1 ring-white/25',
     },
     {
       label: 'رانندگان فعال',
       value: stats?.active ?? 0,
       icon: CheckCircleIcon,
-      tone: 'bg-emerald-50 text-emerald-600',
-      ring: 'ring-emerald-100',
+      wrapper: 'bg-white ring-1 ring-slate-200',
+      labelClass: 'text-slate-500',
+      valueClass: 'text-slate-900',
+      iconWrap: 'bg-emerald-50 text-emerald-600 ring-1 ring-emerald-100',
     },
     {
       label: 'رانندگان غیرفعال',
       value: stats?.inactive ?? 0,
       icon: AlertCircleIcon,
-      tone: 'bg-amber-50 text-amber-600',
-      ring: 'ring-amber-100',
+      wrapper: 'bg-white ring-1 ring-slate-200',
+      labelClass: 'text-slate-500',
+      valueClass: 'text-slate-900',
+      iconWrap: 'bg-amber-50 text-amber-600 ring-1 ring-amber-100',
     },
   ]
 
@@ -71,14 +79,14 @@ export function DashboardPage() {
       <PageHeader
         title="داشبورد"
         description={`خوش آمدید ${user?.display_name ?? ''}. خلاصه وضعیت رانندگان در یک نگاه.`}
-        actions={
+        actions={canManage ? (
           <LinkButton
             to="/drivers/new"
             icon={<PlusIcon className="size-4" />}
           >
             ثبت راننده جدید
           </LinkButton>
-        }
+        ) : undefined}
       />
 
       {error && (
@@ -96,28 +104,31 @@ export function DashboardPage() {
       )}
 
       <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-        {cards.map((card) => {
+        {cards.map((card, index) => {
           const Icon = card.icon
           return (
             <div
               key={card.label}
-              className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm"
+              style={{ animationDelay: `${index * 60}ms` }}
+              className={`animate-fade-in-up rounded-2xl p-5 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md ${card.wrapper}`}
             >
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <p className="text-sm font-medium text-slate-500">
+                  <p className={`text-sm font-medium ${card.labelClass}`}>
                     {card.label}
                   </p>
-                  <p className="mt-2 text-3xl font-bold tracking-tight text-slate-900">
+                  <p
+                    className={`mt-2 text-3xl font-bold tracking-tight ${card.valueClass}`}
+                  >
                     {loading && !stats ? (
-                      <span className="inline-block h-9 w-16 animate-pulse rounded-lg bg-slate-100" />
+                      <span className="inline-block h-9 w-16 animate-pulse rounded-lg bg-slate-200/70" />
                     ) : (
                       toPersianDigits(card.value)
                     )}
                   </p>
                 </div>
                 <span
-                  className={`flex size-11 items-center justify-center rounded-xl ring-4 ${card.tone} ${card.ring}`}
+                  className={`flex size-11 items-center justify-center rounded-xl ${card.iconWrap}`}
                 >
                   <Icon className="size-5" />
                 </span>
@@ -221,7 +232,7 @@ export function DashboardPage() {
             icon={<UsersIcon className="size-6" />}
             title="هنوز راننده‌ای ثبت نشده است"
             description="برای شروع، اولین راننده را با شماره مسلسل دستی ثبت کنید."
-            action={
+            action={canManage ? (
               <LinkButton
                 to="/drivers/new"
                 size="sm"
@@ -229,7 +240,7 @@ export function DashboardPage() {
               >
                 ثبت اولین راننده
               </LinkButton>
-            }
+            ) : undefined}
           />
         )}
       </section>

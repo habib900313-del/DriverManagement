@@ -112,6 +112,7 @@ export interface PeriodAllocationDetail {
   effective_date: string
   payment_date: string
   receipt_number: string
+  description: string
   payment_amount: string
   reversed_at: string | null
   reversal_reason: string
@@ -154,10 +155,13 @@ export interface CashRevenueMonthRow {
   count: number
 }
 
+export type FinancialReportArchiveStatus = 'active' | 'archived' | 'all'
+
 export interface FinancialReport {
   as_of: string
   date_from: string | null
   date_to: string | null
+  archive_status: FinancialReportArchiveStatus
   payments: { count: number; total_amount: string }
   revenue: { cash_revenue: string; recorded_as_of_audit: string }
   debt: {
@@ -182,6 +186,15 @@ export interface DriverPeriodsResponse {
   periods: (PeriodBounds & { fee?: string })[]
 }
 
+export interface PaymentListParams {
+  driver_id?: number
+  date_from?: string
+  date_to?: string
+  search?: string
+  page?: number
+  page_size?: number
+}
+
 export interface DriverFeeHistoryItem {
   id: number
   driver: number
@@ -204,8 +217,8 @@ export interface ReceivePaymentInput {
   payment_date: string
   target_period_start?: string | null
   target_period_end?: string | null
-  periods_count?: number
   receipt_number?: string
+  description?: string
   idempotency_key?: string
 }
 
@@ -284,6 +297,7 @@ export interface PaymentListItem {
   payment_date: string
   effective_date: string
   receipt_number: string
+  description: string
   idempotency_key: string | null
   status: string
   is_void: boolean
@@ -292,10 +306,33 @@ export interface PaymentListItem {
   correction_reason: string
   voided_at: string | null
   corrected_at: string | null
+  corrected_by: number | null
+  corrected_by_name: string | null
   created_by: number
   created_at: string
   updated_at: string
   allocations: PaymentAllocationListItem[]
+  refunds: PaymentRefundListItem[]
+  refunded_total: string
+  refundable_amount: string
+}
+
+export interface PaymentRefundListItem {
+  id: number
+  payment: number
+  amount: string
+  refund_date: string
+  effective_date: string
+  reason: string
+  refunded_by: number
+  refunded_by_name: string
+  created_at: string
+}
+
+export interface PaymentRefundInput {
+  amount: string
+  refund_date: string
+  reason: string
 }
 
 export interface PaymentAllocationListItem {

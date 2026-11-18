@@ -1,9 +1,4 @@
-"""
-Django settings for the Driver Management System.
-
-This application is designed to run fully offline on a single local Mac.
-All data lives on this machine: SQLite for records, local disk for media.
-"""
+"""Shared Django settings with local-development defaults."""
 
 import os
 from pathlib import Path
@@ -44,15 +39,16 @@ def _load_env_file(path):
         os.environ.setdefault(key, value)
 
 
-for _env_name in (".env", ".env.postgres"):
-    _load_env_file(PROJECT_DIR / _env_name)
-del _env_name
+if os.environ.get("DJANGO_SETTINGS_MODULE") != "config.production_settings":
+    for _env_name in (".env", ".env.postgres"):
+        _load_env_file(PROJECT_DIR / _env_name)
+    del _env_name
 
 # ---------------------------------------------------------------------------
 # Security
 #
-# A generated key lives in config/local_settings.py (git-ignored). The
-# environment variable takes precedence, which keeps deployment flexible.
+# These defaults are for local development only. Production uses
+# config.production_settings and requires explicit environment variables.
 # ---------------------------------------------------------------------------
 SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY",
@@ -61,15 +57,24 @@ SECRET_KEY = os.environ.get(
 
 DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
 
-# Only the local machine is allowed to reach this server.
-ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
+
+def _comma_separated_setting(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+ALLOWED_HOSTS = _comma_separated_setting(
+    "DJANGO_ALLOWED_HOSTS", ["127.0.0.1", "localhost"]
+)
 
 # The Vite dev server proxies /api to Django, but the browser still sends
 # its own Origin header, so the dev origins must be trusted for CSRF.
-CSRF_TRUSTED_ORIGINS = [
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
-]
+CSRF_TRUSTED_ORIGINS = _comma_separated_setting(
+    "DJANGO_CSRF_TRUSTED_ORIGINS",
+    ["http://127.0.0.1:5173", "http://localhost:5173"],
+)
 
 # Session/CSRF cookie hardening for the local SPA.
 # The CSRF cookie must stay readable by JavaScript so fetch() can echo it.
@@ -85,7 +90,7 @@ SECURE_CONTENT_TYPE_NOSNIFF = True
 # Applications
 # ---------------------------------------------------------------------------
 INSTALLED_APPS = [
-    "django.contrib.admin",
+    "apps.core.admin_apps.SuperuserOnlyAdminConfig",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
@@ -272,7 +277,8 @@ REST_FRAMEWORK = {
 # Local overrides (generated secret key, optional machine-specific values).
 # Keeping this file out of version control avoids committing secrets.
 # ---------------------------------------------------------------------------
-try:  # pragma: no cover - environment-specific
-    from config.local_settings import *  # noqa: F401,F403,E402
-except ImportError:
-    pass
+if os.environ.get("DJANGO_SETTINGS_MODULE") != "config.production_settings":
+    try:  # pragma: no cover - environment-specific
+        from config.local_settings import *  # noqa: F401,F403,E402
+    except ImportError:
+        pass

@@ -70,14 +70,14 @@ export function PhotoUpload({
           if (dropped) accept(dropped)
         }}
         className={cn(
-          'flex flex-wrap items-center gap-4 rounded-xl border border-dashed px-4 py-4 transition',
+          'flex flex-wrap items-center gap-4 rounded-2xl border border-dashed px-4 py-4 transition',
           shownError
             ? 'border-rose-300 bg-rose-50/40'
-            : 'border-slate-300 bg-slate-50/60',
+            : 'border-slate-300 bg-slate-50/60 hover:border-brand-300 hover:bg-brand-50/30',
           disabled && 'opacity-60',
         )}
       >
-        <div className="flex size-20 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-white">
+        <div className="flex size-20 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xs">
           {source ? (
             <img
               src={source}
@@ -105,7 +105,7 @@ export function PhotoUpload({
               type="button"
               disabled={disabled}
               onClick={() => inputRef.current?.click()}
-              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-2.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:pointer-events-none disabled:opacity-50"
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-2.5 text-xs font-medium text-slate-700 shadow-xs transition hover:border-slate-400 hover:bg-slate-50 disabled:pointer-events-none disabled:opacity-50"
             >
               <CameraIcon className="size-4" />
               {source ? 'تغییر عکس' : 'انتخاب عکس'}
@@ -118,7 +118,7 @@ export function PhotoUpload({
                   setLocalError(null)
                   onChange(null)
                 }}
-                className="inline-flex h-8 items-center gap-1 rounded-lg px-2.5 text-xs font-medium text-rose-600 transition hover:bg-rose-50 disabled:pointer-events-none disabled:opacity-50"
+                className="inline-flex h-8 items-center gap-1 rounded-lg px-2.5 text-xs font-medium text-rose-600 transition hover:bg-rose-100/70 disabled:pointer-events-none disabled:opacity-50"
               >
                 <XIcon className="size-3.5" />
                 حذف انتخاب

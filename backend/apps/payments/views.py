@@ -4,16 +4,18 @@ No DELETE endpoints exist. Status changes only via action endpoints with a
 required reason. FinancialError → 400 {detail, code}; lock contention → 409.
 """
 
-from django.db import IntegrityError, OperationalError, models
+from django.db import IntegrityError, OperationalError, transaction, models
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.permissions import IsAuthenticated
 
-from .permissions import IsManager, IsManagerOrReadOnly
+from .permissions import IsManager
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.core.activity import log_activity
+from apps.core.models import ActivityLog
 from apps.drivers.models import Driver, DriverFeeHistory
 
 from . import services
@@ -27,6 +29,7 @@ from .models import (
 )
 from .periods import consecutive_periods, fee_for_period, reconstruct_periods
 from .reporting import (
+    FINANCIAL_REPORT_ARCHIVE_STATUSES,
     cash_revenue_report,
     conservation_report,
     driver_financial_summary,
@@ -48,6 +51,8 @@ from .serializers import (
     OnlinePaymentInput,
     OnlinePaymentSerializer,
     OnlinePaymentVoidInput,
+    PaymentRefundInput,
+    PaymentRefundSerializer,
     PaymentSerializer,
     ReasonInput,
     ReceivePaymentInput,
@@ -120,10 +125,27 @@ class PaymentListCreateView(FinancialAPIView, generics.ListAPIView):
         return [IsAuthenticated()]
 
     def get_queryset(self):
-        queryset = Payment.objects.select_related("driver").order_by("-created_at", "-id")
+        queryset = (
+            Payment.objects.select_related("driver")
+            .prefetch_related("refunds")
+            .order_by("-created_at", "-id")
+        )
         driver_id = self.request.query_params.get("driver_id")
         if driver_id and driver_id.isdigit():
             queryset = queryset.filter(driver_id=int(driver_id))
+        date_from = self.request.query_params.get("date_from")
+        if date_from:
+            queryset = queryset.filter(payment_date__gte=date_from)
+        date_to = self.request.query_params.get("date_to")
+        if date_to:
+            queryset = queryset.filter(payment_date__lte=date_to)
+        search = self.request.query_params.get("search")
+        if search:
+            queryset = queryset.filter(
+                models.Q(driver__driver_code__icontains=search)
+                | models.Q(driver__full_name__icontains=search)
+                | models.Q(receipt_number__icontains=search)
+            )
         return queryset
 
     def post(self, request):
@@ -146,6 +168,7 @@ class PaymentListCreateView(FinancialAPIView, generics.ListAPIView):
                 target_period=target,
                 periods_count=data.get("periods_count") or 1,
                 receipt_number=data.get("receipt_number", ""),
+                description=data.get("description", ""),
                 idempotency_key=data.get("idempotency_key") or None,
             )
 
@@ -154,7 +177,7 @@ class PaymentListCreateView(FinancialAPIView, generics.ListAPIView):
 
 class PaymentDetailView(FinancialAPIView, generics.RetrieveAPIView):
     serializer_class = PaymentSerializer
-    queryset = Payment.objects.select_related("driver")
+    queryset = Payment.objects.select_related("driver").prefetch_related("refunds")
 
 
 class PaymentVoidView(FinancialAPIView):
@@ -196,6 +219,27 @@ class PaymentCorrectView(FinancialAPIView):
             )
 
         return self.call_service(run, PaymentSerializer, status.HTTP_201_CREATED)
+
+
+class PaymentRefundView(FinancialAPIView):
+    permission_classes = [IsManager]
+
+    def post(self, request, pk):
+        payment = get_object_or_404(Payment, pk=pk)
+        serializer = PaymentRefundInput(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        return self.call_service(
+            lambda: services.refund_payment(
+                payment=payment,
+                amount=data["amount"],
+                refund_date=data["refund_date"],
+                user=request.user,
+                reason=data["reason"],
+            ),
+            PaymentRefundSerializer,
+            status.HTTP_201_CREATED,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +591,18 @@ class FinancialReportView(FinancialAPIView):
                 raise FinancialError("date_from نباید بعد از date_to باشد.", "invalid_date")
             if date_to and as_of and date_to > as_of:
                 raise FinancialError("date_to نباید بعد از as_of باشد (F4).", "invalid_date")
-            return financial_report(date_from=date_from, date_to=date_to, as_of=as_of)
+            archive_status = request.query_params.get("archive_status", "active").strip()
+            if archive_status not in FINANCIAL_REPORT_ARCHIVE_STATUSES:
+                raise FinancialError(
+                    "archive_status معتبر نیست.",
+                    "invalid_archive_status",
+                )
+            return financial_report(
+                date_from=date_from,
+                date_to=date_to,
+                as_of=as_of,
+                archive_status=archive_status,
+            )
 
         return self.call_service(run)
 
@@ -596,20 +651,42 @@ class OnlinePaymentListCreateView(FinancialAPIView):
         data = serializer.validated_data
 
         def run():
-            driver = get_object_or_404(Driver, pk=data["driver_id"])
-            if driver.driver_type != "online":
-                raise FinancialError(
-                    "فقط برای راننده‌های آنلاین مجاز است.", "driver_not_online"
+            with transaction.atomic():
+                driver = get_object_or_404(
+                    Driver.objects.select_for_update(), pk=data["driver_id"]
                 )
-            return OnlinePayment.objects.create(
-                driver=driver,
-                amount=data["amount"],
-                payment_date=data["payment_date"],
-                purpose=data["purpose"],
-                description=data.get("description", ""),
-                recorded_by=request.user,
-                status=OnlinePaymentStatus.RECEIVED,
-            )
+                if driver.driver_type != "online":
+                    raise FinancialError(
+                        "فقط برای راننده‌های آنلاین مجاز است.", "driver_not_online"
+                    )
+                payment = OnlinePayment.objects.create(
+                    driver=driver,
+                    amount=data["amount"],
+                    payment_date=data["payment_date"],
+                    purpose=data["purpose"],
+                    description=data.get("description", ""),
+                    recorded_by=request.user,
+                    status=OnlinePaymentStatus.RECEIVED,
+                )
+                log_activity(
+                    actor=request.user,
+                    action="online_payment_create",
+                    module=ActivityLog.Module.PAYMENTS,
+                    description=f"ثبت پرداخت آنلاین برای راننده «{driver.full_name}».",
+                    target_type="online_payment",
+                    target_id=payment.pk,
+                    target_label=f"{driver.driver_code} — {driver.full_name}",
+                    after_data={
+                        "payment_id": payment.pk,
+                        "driver_id": driver.pk,
+                        "amount": payment.amount,
+                        "payment_date": payment.payment_date,
+                        "purpose": payment.purpose,
+                        "status": payment.status,
+                    },
+                    request=request,
+                )
+            return payment
 
         return self.call_service(run, OnlinePaymentSerializer, status.HTTP_201_CREATED)
 
@@ -626,24 +703,54 @@ class OnlinePaymentVoidView(FinancialAPIView):
 
     def post(self, request, pk):
         payment = get_object_or_404(OnlinePayment, pk=pk)
+        payment_id = payment.pk
+        driver_id = payment.driver_id
         serializer = ReasonInput(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         def run():
-            if payment.status == OnlinePaymentStatus.VOIDED:
-                raise FinancialError(
-                    "این پرداخت قبلاً باطل شده است.", "already_voided"
+            with transaction.atomic():
+                driver = get_object_or_404(
+                    Driver.objects.select_for_update(), pk=driver_id
                 )
-            now = timezone.now()
-            payment.status = OnlinePaymentStatus.VOIDED
-            payment.voided_at = now
-            payment.voided_by = request.user
-            payment.void_reason = serializer.validated_data["reason"]
-            payment.save(
-                update_fields=[
-                    "status", "voided_at", "voided_by", "void_reason"
-                ]
-            )
+                payment = get_object_or_404(
+                    OnlinePayment.objects.select_for_update().select_related("driver"),
+                    pk=payment_id,
+                    driver_id=driver.pk,
+                )
+                if payment.status == OnlinePaymentStatus.VOIDED:
+                    raise FinancialError(
+                        "این پرداخت قبلاً باطل شده است.", "already_voided"
+                    )
+                now = timezone.now()
+                payment.status = OnlinePaymentStatus.VOIDED
+                payment.voided_at = now
+                payment.voided_by = request.user
+                payment.void_reason = serializer.validated_data["reason"]
+                payment.save(
+                    update_fields=[
+                        "status", "voided_at", "voided_by", "void_reason"
+                    ]
+                )
+                log_activity(
+                    actor=request.user,
+                    action="online_payment_void",
+                    module=ActivityLog.Module.PAYMENTS,
+                    description=(
+                        f"ابطال پرداخت آنلاین راننده «{payment.driver.full_name}»."
+                    ),
+                    target_type="online_payment",
+                    target_id=payment.pk,
+                    target_label=payment.driver.driver_code,
+                    before_data={"status": OnlinePaymentStatus.RECEIVED},
+                    after_data={
+                        "payment_id": payment.pk,
+                        "amount": payment.amount,
+                        "status": payment.status,
+                        "reason": payment.void_reason,
+                    },
+                    request=request,
+                )
             return payment
 
         return self.call_service(run, OnlinePaymentSerializer)
@@ -661,43 +768,80 @@ class OnlinePaymentCorrectView(FinancialAPIView):
 
     def post(self, request, pk):
         payment = get_object_or_404(OnlinePayment, pk=pk)
+        payment_id = payment.pk
+        driver_id = payment.driver_id
         serializer = OnlinePaymentCorrectInput(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
         def run():
-            if payment.status != OnlinePaymentStatus.RECEIVED:
-                raise FinancialError(
-                    "فقط پرداخت دریافت‌شده قابل اصلاح است.", "already_invalid"
+            with transaction.atomic():
+                driver = get_object_or_404(
+                    Driver.objects.select_for_update(), pk=driver_id
                 )
-            new_amount = data.get("new_amount")
-            if new_amount is None:
-                new_amount = payment.amount
-            new_date = data.get("new_payment_date") or payment.payment_date
-            if new_date > timezone.localdate():
-                raise FinancialError(
-                    "تاریخ پرداخت نمی‌تواند در آینده باشد.", "invalid_date"
+                payment = get_object_or_404(
+                    OnlinePayment.objects.select_for_update().select_related("driver"),
+                    pk=payment_id,
+                    driver_id=driver.pk,
                 )
-            now = timezone.now()
-            payment.status = OnlinePaymentStatus.CORRECTED
-            payment.corrected_at = now
-            payment.corrected_by = request.user
-            payment.correction_reason = data["reason"]
-            payment.save(
-                update_fields=[
-                    "status", "corrected_at", "corrected_by", "correction_reason"
-                ]
-            )
-            return OnlinePayment.objects.create(
-                driver=payment.driver,
-                amount=new_amount,
-                payment_date=new_date,
-                purpose=data.get("new_purpose") or payment.purpose,
-                description=data.get("new_description", payment.description),
-                recorded_by=request.user,
-                status=OnlinePaymentStatus.RECEIVED,
-                correction_of=payment,
-            )
+                if payment.status != OnlinePaymentStatus.RECEIVED:
+                    raise FinancialError(
+                        "فقط پرداخت دریافت‌شده قابل اصلاح است.", "already_invalid"
+                    )
+                new_amount = data.get("new_amount")
+                if new_amount is None:
+                    new_amount = payment.amount
+                new_date = data.get("new_payment_date") or payment.payment_date
+                if new_date > timezone.localdate():
+                    raise FinancialError(
+                        "تاریخ پرداخت نمی‌تواند در آینده باشد.", "invalid_date"
+                    )
+                now = timezone.now()
+                payment.status = OnlinePaymentStatus.CORRECTED
+                payment.corrected_at = now
+                payment.corrected_by = request.user
+                payment.correction_reason = data["reason"]
+                payment.save(
+                    update_fields=[
+                        "status", "corrected_at", "corrected_by", "correction_reason"
+                    ]
+                )
+                replacement = OnlinePayment.objects.create(
+                    driver=payment.driver,
+                    amount=new_amount,
+                    payment_date=new_date,
+                    purpose=data.get("new_purpose") or payment.purpose,
+                    description=data.get("new_description", payment.description),
+                    recorded_by=request.user,
+                    status=OnlinePaymentStatus.RECEIVED,
+                    correction_of=payment,
+                )
+                log_activity(
+                    actor=request.user,
+                    action="online_payment_correct",
+                    module=ActivityLog.Module.PAYMENTS,
+                    description=(
+                        f"اصلاح پرداخت آنلاین راننده «{payment.driver.full_name}»."
+                    ),
+                    target_type="online_payment",
+                    target_id=replacement.pk,
+                    target_label=payment.driver.driver_code,
+                    before_data={
+                        "payment_id": payment.pk,
+                        "amount": payment.amount,
+                        "payment_date": payment.payment_date,
+                        "status": OnlinePaymentStatus.CORRECTED,
+                    },
+                    after_data={
+                        "payment_id": replacement.pk,
+                        "amount": replacement.amount,
+                        "payment_date": replacement.payment_date,
+                        "correction_of": payment.pk,
+                        "reason": data["reason"],
+                    },
+                    request=request,
+                )
+            return replacement
 
         return self.call_service(run, OnlinePaymentSerializer, status.HTTP_201_CREATED)
 

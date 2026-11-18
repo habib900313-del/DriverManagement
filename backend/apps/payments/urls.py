@@ -9,6 +9,7 @@ urlpatterns = [
     path("payments/<int:pk>/", views.PaymentDetailView.as_view(), name="payment-detail"),
     path("payments/<int:pk>/void/", views.PaymentVoidView.as_view(), name="payment-void"),
     path("payments/<int:pk>/correct/", views.PaymentCorrectView.as_view(), name="payment-correct"),
+    path("payments/<int:pk>/refund/", views.PaymentRefundView.as_view(), name="payment-refund"),
     path("allocations/<int:pk>/correct/", views.AllocationCorrectView.as_view(), name="allocation-correct"),
     path("allocations/<int:pk>/correct-credit/", views.AllocationCorrectCreditView.as_view(), name="allocation-correct-credit"),
     path("credits/consume/", views.CreditConsumeView.as_view(), name="credit-consume"),

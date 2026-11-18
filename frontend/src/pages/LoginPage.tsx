@@ -58,25 +58,29 @@ export function LoginPage() {
 
   if (loading) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-slate-100">
-        <Spinner className="size-8 text-slate-400" />
+      <div className="flex min-h-screen items-center justify-center">
+        <Spinner className="size-8 text-brand-500" />
       </div>
     )
   }
 
   return (
-    <div className="grid min-h-screen bg-slate-100 lg:grid-cols-[1.05fr_1fr]">
-      <div className="relative hidden overflow-hidden bg-slate-900 p-12 text-white lg:flex lg:flex-col lg:justify-between">
-        <div className="absolute -left-24 -top-24 size-72 rounded-full bg-white/5" />
-        <div className="absolute -bottom-32 -right-16 size-96 rounded-full bg-white/5" />
+    <div className="grid min-h-screen lg:grid-cols-[1.05fr_1fr]">
+      <div className="relative hidden overflow-hidden bg-gradient-to-br from-slate-900 via-slate-900 to-brand-950 p-12 text-white lg:flex lg:flex-col lg:justify-between">
+        <div
+          aria-hidden="true"
+          className="absolute inset-0 opacity-[0.15] [background-image:linear-gradient(to_right,rgb(255_255_255_/_0.25)_1px,transparent_1px),linear-gradient(to_bottom,rgb(255_255_255_/_0.25)_1px,transparent_1px)] [background-size:44px_44px]"
+        />
+        <div className="absolute -left-24 -top-24 size-72 rounded-full bg-brand-500/20 blur-3xl" />
+        <div className="absolute -bottom-32 -right-16 size-96 rounded-full bg-sky-500/15 blur-3xl" />
         <div className="relative">
           <div className="flex items-center gap-3">
-            <span className="flex size-11 items-center justify-center rounded-2xl bg-white/10 ring-1 ring-white/15">
+            <span className="flex size-11 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-400 to-brand-600 shadow-lg shadow-brand-900/50 ring-1 ring-white/20">
               <ShieldIcon className="size-6" />
             </span>
             <div>
               <p className="text-base font-bold">سیستم مدیریت رانندگان</p>
-              <p className="text-xs text-slate-400">نسخه اداری محلی</p>
+              <p className="text-xs text-slate-400">سامانه آنلاین مدیریت رانندگان</p>
             </div>
           </div>
 
@@ -84,15 +88,16 @@ export function LoginPage() {
             مدیریت منظم رانندگان، از ثبت تا پیگیری وضعیت
           </h1>
           <p className="mt-4 max-w-md text-sm leading-7 text-slate-300">
-            ثبت شماره مسلسل دستی، نگهداری مشخصات و عکس، جستجوی سریع و مدیریت
-            فعال یا غیرفعال بودن رانندگان — همه در یک محیط امن و محلی.
+            ثبت مشخصات، مدیریت اسناد، پیگیری پرداخت‌ها و نظارت بر وضعیت رانندگان
+            در یک سامانه یکپارچه.
           </p>
 
           <ul className="mt-10 space-y-3 text-sm text-slate-300">
             {[
-              'اطلاعات فقط روی همین دستگاه ذخیره می‌شود',
-              'دسترسی به اطلاعات تنها پس از ورود مدیر',
+              'اطلاعات متمرکز روی سرور',
+              'دسترسی محدود بر اساس سطح مجوز کاربران',
               'پشتیبانی از تقویم شمسی و میلادی',
+              'دسترسی آنلاین برای کاربران دارای حساب مجاز',
             ].map((item) => (
               <li key={item} className="flex items-center gap-2.5">
                 <span className="flex size-5 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-400">
@@ -105,26 +110,25 @@ export function LoginPage() {
         </div>
 
         <p className="relative text-xs text-slate-500">
-          داده‌های این سیستم شامل اطلاعات شخصی رانندگان است؛ دسترسی غیرمجاز
-          ممنوع می‌باشد.
+          اطلاعات شخصی و مالی رانندگان محرمانه است؛ دسترسی غیرمجاز ممنوع می‌باشد.
         </p>
       </div>
 
       <div className="flex items-center justify-center px-4 py-10 sm:px-8">
         <div className="w-full max-w-md">
           <div className="mb-8 flex items-center gap-3 lg:hidden">
-            <span className="flex size-10 items-center justify-center rounded-xl bg-slate-900 text-white">
+            <span className="flex size-10 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-brand-600 text-white shadow-md shadow-brand-600/25">
               <ShieldIcon className="size-5" />
             </span>
             <div>
               <p className="text-sm font-bold text-slate-900">
                 سیستم مدیریت رانندگان
               </p>
-              <p className="text-xs text-slate-500">نسخه اداری محلی</p>
+              <p className="text-xs text-slate-500">سامانه آنلاین مدیریت رانندگان</p>
             </div>
           </div>
 
-          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xl shadow-slate-900/5 sm:p-8">
+          <div className="animate-fade-in-up rounded-2xl border border-slate-200 bg-white/95 p-6 shadow-xl shadow-brand-900/5 backdrop-blur sm:p-8">
             <div>
               <h2 className="text-xl font-bold text-slate-900">ورود مدیر سیستم</h2>
               <p className="mt-1 text-sm leading-6 text-slate-500">
@@ -160,7 +164,7 @@ export function LoginPage() {
                     dir="ltr"
                     value={username}
                     onChange={(event) => setUsername(event.target.value)}
-                    className="h-11 w-full rounded-lg border border-slate-300 bg-white pe-3 ps-10 text-sm text-slate-900 shadow-sm outline-none transition placeholder:text-slate-400 focus:border-slate-500 focus:ring-2 focus:ring-slate-900/10"
+                    className="h-11 w-full rounded-xl border border-slate-300 bg-white pe-3 ps-10 text-sm text-slate-900 shadow-xs outline-none transition placeholder:text-slate-400 hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
                     placeholder="نام کاربری مدیر"
                   />
                 </div>
@@ -183,7 +187,7 @@ export function LoginPage() {
                     dir="ltr"
                     value={password}
                     onChange={(event) => setPassword(event.target.value)}
-                    className="h-11 w-full rounded-lg border border-slate-300 bg-white pe-11 ps-10 text-sm text-slate-900 shadow-sm outline-none transition placeholder:text-slate-400 focus:border-slate-500 focus:ring-2 focus:ring-slate-900/10"
+                    className="h-11 w-full rounded-xl border border-slate-300 bg-white pe-11 ps-10 text-sm text-slate-900 shadow-xs outline-none transition placeholder:text-slate-400 hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
                     placeholder="رمز عبور"
                   />
                   <button
@@ -206,7 +210,7 @@ export function LoginPage() {
               <button
                 type="submit"
                 disabled={submitting}
-                className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-slate-900 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 disabled:pointer-events-none disabled:opacity-60"
+                className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-b from-brand-500 to-brand-600 text-sm font-semibold text-white shadow-md shadow-brand-600/25 transition-all duration-150 hover:from-brand-500 hover:to-brand-700 hover:shadow-lg hover:shadow-brand-600/30 active:translate-y-px focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500 disabled:pointer-events-none disabled:opacity-60"
               >
                 {submitting && <Spinner className="size-4" />}
                 {submitting ? 'در حال ورود…' : 'ورود به سیستم'}
@@ -220,7 +224,7 @@ export function LoginPage() {
           </div>
 
           <p className="mt-6 text-center text-xs text-slate-400">
-            تمام اطلاعات روی همین دستگاه ذخیره می‌شود.
+            اطلاعات شخصی و مالی رانندگان محرمانه است؛ دسترسی غیرمجاز ممنوع می‌باشد.
           </p>
         </div>
       </div>

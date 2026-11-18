@@ -1,11 +1,17 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { DualDateInput } from '../components/DualDateInput'
 import { ArrowRightIcon, CalendarIcon, PrinterIcon, RefreshIcon } from '../components/icons'
 import { Button } from '../components/ui/Button'
 import { PageHeader } from '../components/ui/PageHeader'
 import { useToast } from '../context/ToastContext'
 import { fetchCashRevenueReport } from '../lib/api'
-import { formatJalaliShort, formatKabulDateTime, toPersianDigits } from '../lib/dates'
+import {
+  formatJalaliShort,
+  formatKabulDateTime,
+  toPersianDigits,
+  validateDateRange,
+} from '../lib/dates'
 import { getErrorMessage, isAbortError } from '../lib/errors'
 import type { CashRevenueReport } from '../types/financial'
 
@@ -19,11 +25,14 @@ export function CashRevenueReportPage() {
   const { notify } = useToast()
 
   // Spec F4: the report range must end on or before the report date.
-  // Native date inputs require Gregorian ISO values (YYYY-MM-DD), not the
-  // Jalali presentation value used elsewhere in the report.
+  // The Jalali pickers hold Gregorian ISO values (YYYY-MM-DD) internally so
+  // they can be sent to the API as-is, while users pick dates on a Jalali
+  // (Hijri Shamsi) calendar.
   const reportDate = asOf || reportGeneratedAt.slice(0, 10)
+  const rangeError = validateDateRange(dateFrom, dateTo, reportDate)
 
   const load = useCallback(async () => {
+    if (rangeError) return
     setError(null)
     try {
       const data = await fetchCashRevenueReport(asOf || undefined, dateFrom || undefined, dateTo || undefined)
@@ -35,7 +44,7 @@ export function CashRevenueReportPage() {
         notify('error', msg)
       }
     }
-  }, [asOf, dateFrom, dateTo, notify])
+  }, [asOf, dateFrom, dateTo, notify, rangeError])
 
   useEffect(() => {
     load()
@@ -63,49 +72,32 @@ export function CashRevenueReportPage() {
 
         <form className="space-y-4 p-5" onSubmit={(e) => { e.preventDefault(); load() }}>
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            <div className="flex flex-col gap-1">
-              <label className="text-xs font-medium text-slate-600" htmlFor="cash-as-of">
-                تاریخ محاسبه (اختیاری)
-              </label>
-              <input
-                id="cash-as-of"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                type="date"
-                value={asOf}
-                onChange={(e) => setAsOf(e.target.value)}
-              />
-            </div>
+            <DualDateInput
+              id="cash-as-of"
+              label="تاریخ محاسبه (اختیاری)"
+              value={asOf}
+              onChange={setAsOf}
+              allowGregorian={false}
+            />
 
-            <div className="flex flex-col gap-1">
-              <label className="text-xs font-medium text-slate-600" htmlFor="cash-from">
-                از تاریخ (اختیاری)
-              </label>
-              <input
-                id="cash-from"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                type="date"
-                value={dateFrom}
-                max={dateTo || reportDate}
-                onChange={(e) => setDateFrom(e.target.value)}
-              />
-            </div>
+            <DualDateInput
+              id="cash-from"
+              label="از تاریخ (اختیاری)"
+              value={dateFrom}
+              onChange={setDateFrom}
+              allowGregorian={false}
+            />
 
-            <div className="flex flex-col gap-1">
-              <label className="text-xs font-medium text-slate-600" htmlFor="cash-to">
-                تا تاریخ (اختیاری)
-              </label>
-              <input
-                id="cash-to"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                type="date"
-                value={dateTo}
-                max={reportDate}
-                onChange={(e) => setDateTo(e.target.value)}
-              />
-            </div>
+            <DualDateInput
+              id="cash-to"
+              label="تا تاریخ (اختیاری)"
+              value={dateTo}
+              onChange={setDateTo}
+              allowGregorian={false}
+            />
 
-            <div className="flex items-end gap-2">
-              <Button type="submit" icon={<CalendarIcon className="size-4" />}>
+            <div className="flex flex-col gap-2">
+              <Button type="submit" disabled={Boolean(rangeError)} icon={<CalendarIcon className="size-4" />}>
                 نمایش گزارش
               </Button>
               <Button
@@ -119,10 +111,16 @@ export function CashRevenueReportPage() {
             </div>
           </div>
 
-          <p className="text-xs text-slate-500">
-            «از تاریخ» و «تا تاریخ» باید با هم انتخاب شوند و پایان بازه نباید بعد از تاریخ محاسبه باشد.
-            برای ذخیره گزارش به‌صورت PDF از گزینهٔ «چاپ گزارش» و سپس «Save as PDF» مرورگر استفاده کنید.
-          </p>
+          {rangeError ? (
+            <p className="flex items-center gap-2 rounded-lg bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700 ring-1 ring-rose-100">
+              {rangeError}
+            </p>
+          ) : (
+            <p className="text-xs text-slate-500">
+              «از تاریخ» و «تا تاریخ» باید با هم انتخاب شوند و پایان بازه نباید بعد از تاریخ محاسبه باشد.
+              برای ذخیره گزارش به‌صورت PDF از گزینهٔ «چاپ گزارش» و سپس «Save as PDF» مرورگر استفاده کنید.
+            </p>
+          )}
         </form>
       </section>
 

@@ -174,9 +174,9 @@ export function JalaliCalendar({
               className={cn(
                 'flex aspect-square items-center justify-center rounded-lg text-sm transition',
                 isSelected
-                  ? 'bg-slate-900 font-semibold text-white'
+                  ? 'bg-gradient-to-b from-brand-500 to-brand-600 font-semibold text-white shadow-sm shadow-brand-600/25'
                   : isToday
-                    ? 'border border-slate-300 font-semibold text-slate-900 hover:bg-slate-100'
+                    ? 'border border-brand-300 font-semibold text-brand-700 hover:bg-brand-50'
                     : 'text-slate-700 hover:bg-slate-100',
               )}
             >

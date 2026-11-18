@@ -22,6 +22,7 @@ from .models import (
     FeeSchedule,
     Payment,
     PaymentAllocation,
+    PaymentRefund,
     PaymentStatus,
 )
 from .periods import (
@@ -30,7 +31,16 @@ from .periods import (
     fee_for_period,
     target_period_error,
 )
+from apps.core.activity import log_activity
+from apps.core.models import ActivityLog
 from apps.drivers.models import Driver, DriverFeeHistory
+
+
+def _period_label(start, end):
+    """Readable quarter label for audit payloads."""
+    if start is None or end is None:
+        return ""
+    return f"{start} → {end}"
 
 
 class FinancialError(Exception):
@@ -103,8 +113,7 @@ def _target_periods(driver, target_period, periods_count):
     """The ordered list of periods a payment is spread over.
 
     ``periods_count`` quarters are taken consecutively from ``target_period``.
-    With no target period the payment is not booked on any quarter and stays
-    entirely on the credit path.
+    A missing target yields no periods and is rejected by the allocator.
     """
     if target_period is None:
         return []
@@ -118,6 +127,35 @@ def _target_periods(driver, target_period, periods_count):
 def _touch_payment(payment):
     """Refresh the payment's updated_at timestamp."""
     payment.save(update_fields=["updated_at"])
+
+
+def _lock_payment_allocation(allocation_id):
+    """Lock a payment's driver, payment, then allocation in the shared order."""
+    payment_id = PaymentAllocation.objects.values_list(
+        "payment_id", flat=True
+    ).get(pk=allocation_id)
+    driver_id = Payment.objects.values_list("driver_id", flat=True).get(
+        pk=payment_id
+    )
+    driver = Driver.objects.select_for_update().get(pk=driver_id)
+    payment = Payment.objects.select_for_update().get(pk=payment_id)
+    if payment.driver_id != driver.pk:
+        raise FinancialError(
+            "راننده پرداخت هنگام قفل‌گذاری تغییر کرده است؛ دوباره تلاش کنید.",
+            "concurrent_driver_change",
+        )
+    allocation = PaymentAllocation.objects.select_for_update().get(
+        pk=allocation_id, payment_id=payment.pk
+    )
+    allocation.payment = payment
+    return driver, payment, allocation
+
+
+def lock_current_fee_schedule():
+    """Serialize driver creation with changes to the global fee schedule."""
+    return FeeSchedule.objects.select_for_update().order_by(
+        "-effective_from", "-pk"
+    ).first()
 
 
 def _reverse_allocation(allocation, now, user, reason):
@@ -134,43 +172,37 @@ def _reverse_allocation(allocation, now, user, reason):
     )
 
 
-def _split_into_allocations(payment, driver, target_periods, user, payment_date):
+def _split_into_allocations(
+    payment, driver, target_periods, user, payment_date, *, auto_extend=False
+):
     """Spread a received payment over the target periods.
 
-    - For each target period (in order): one FEE_PERIOD allocation for that
-      period's fee, limited by the amount still left.
-    - Whatever is left over becomes one CREDIT allocation — a trackable
-      prepayment that can be booked on a later quarter or consumed manually.
-    - Without any target period the whole amount stays on the credit path.
-
-    The sum of the allocations never exceeds the payment amount, so the
-    allocation-cap trigger stays satisfied.
+    Allocations use each period's full outstanding balance, including
+    transferred debt. When enabled, periods are generated consecutively until
+    the complete payment is assigned; no new CREDIT allocation is created.
     """
     if not target_periods:
-        PaymentAllocation.objects.create(
-            payment=payment,
-            allocation_type=AllocationType.CREDIT,
-            target_period_start=None,
-            target_period_end=None,
-            allocated_amount=payment.amount,
-            effective_date=payment_date,
-            allocated_by=user,
+        raise FinancialError(
+            "دوره هدف الزامی است؛ پرداخت باید مستقیماً به یک دوره مالی تخصیص یابد.",
+            "target_period_required",
         )
-        return
 
     remaining = payment.amount
-    for start, end in target_periods:
-        if remaining <= 0:
-            break
-        # Spec W1: the fee allocation is limited by what is still open on the
-        # target period's own fee — not by the period's fee itself. Using the
-        # fee would let a period be over-allocated (a second payment on a
-        # period that is already settled) and equation (O) would break.
-        # `remaining_own` is the own fee minus every reduction already
-        # booked on the period (its own allocations, waivers, credit
-        # consumed and transfers out), so it never double-books the fee.
-        open_fee = DriverLedger(driver).period_state(start, end).remaining_own
-        fee_alloc_amount = min(open_fee, remaining)
+    periods = iter(target_periods)
+    last_period = None
+    while remaining > 0:
+        try:
+            start, end = next(periods)
+        except StopIteration:
+            if not auto_extend or last_period is None:
+                break
+            following = consecutive_periods(driver, last_period[0], 2)
+            if len(following) != 2:
+                break
+            start, end = following[1]
+        last_period = (start, end)
+        open_balance = DriverLedger(driver).period_state(start, end).balance
+        fee_alloc_amount = min(open_balance, remaining)
         if fee_alloc_amount <= 0:
             continue
         PaymentAllocation.objects.create(
@@ -184,14 +216,10 @@ def _split_into_allocations(payment, driver, target_periods, user, payment_date)
         )
         remaining -= fee_alloc_amount
     if remaining > 0:
-        PaymentAllocation.objects.create(
-            payment=payment,
-            allocation_type=AllocationType.CREDIT,
-            target_period_start=None,
-            target_period_end=None,
-            allocated_amount=remaining,
-            effective_date=payment_date,
-            allocated_by=user,
+        raise FinancialError(
+            "مبلغ پرداختی بیشتر از کل بدهی معتبر دوره‌های انتخاب‌شده است؛ "
+            "هیچ مبلغی بدون تخصیص به دوره ثبت نمی‌شود.",
+            "amount_exceeds_period_debt",
         )
 
 
@@ -204,6 +232,7 @@ def receive_payment(
     target_period: tuple[date, date] | None = None,
     periods_count: int = 1,
     receipt_number: str = "",
+    description: str = "",
     idempotency_key: str | None = None,
 ) -> Payment:
     """Receive a payment with robust idempotency handling.
@@ -229,69 +258,95 @@ def receive_payment(
         # Reject an unusable target before anything is written (§8.2, C6).
         _validate_allocation_period(driver, *target_period, allow_future=True)
     with transaction.atomic():
+        # Lock the driver row first to serialize concurrent financial
+        # operations on the same driver and prevent over-allocation of
+        # period debt across parallel requests (§ race-condition guard).
+        driver = Driver.objects.select_for_update().get(pk=driver.pk)
         _touch_driver(driver)
         _ensure_writable_driver(driver)
+
+        def matches_existing_payment(existing):
+            if (
+                existing.driver_id != driver.id
+                or existing.amount != amount
+                or existing.payment_date != payment_date
+            ):
+                return False
+            alloc = existing.allocations.order_by("id").first()
+            return bool(
+                alloc
+                and alloc.allocation_type == AllocationType.FEE_PERIOD
+                and target_period is not None
+                and alloc.target_period_start == target_period[0]
+                and alloc.target_period_end == target_period[1]
+            )
+
         # Idempotency: if key provided, check for an existing payment.
         if idempotency_key:
             existing = (
                 Payment.objects.filter(idempotency_key=idempotency_key).first()
             )
             if existing is not None:
-                # Verify it is the same logical payment operation.
-                if (
-                    existing.driver_id != driver.id
-                    or existing.amount != amount
-                    or existing.payment_date != payment_date
-                ):
+                if not matches_existing_payment(existing):
                     raise FinancialError(
                         "شناسه تکراری با پارامترهای متفاوت ثبت شده است.",
                         "idempotency_key_conflict",
                     )
-                # Cross-check target financial period via the allocation.
-                if target_period is not None:
-                    alloc = existing.allocations.first()
-                    if (
-                        alloc is None
-                        or alloc.allocation_type != AllocationType.FEE_PERIOD
-                        or alloc.target_period_start != target_period[0]
-                        or alloc.target_period_end != target_period[1]
-                    ):
-                        raise FinancialError(
-                            "شناسه تکراری با پارامترهای متفاوت ثبت شده است.",
-                            "idempotency_key_conflict",
-                        )
-                else:
-                    alloc = existing.allocations.filter(
-                        allocation_type=AllocationType.CREDIT
-                    ).first()
-                    if alloc is None:
-                        raise FinancialError(
-                            "شناسه تکراری با پارامترهای متفاوت ثبت شده است.",
-                            "idempotency_key_conflict",
-                        )
                 return existing
         try:
-            payment = Payment.objects.create(
-                driver=driver,
-                amount=amount,
-                payment_date=payment_date,
-                effective_date=payment_date,
-                receipt_number=receipt_number or "",
-                idempotency_key=idempotency_key or None,
-                status=PaymentStatus.RECEIVED,
-                created_by=user,
-            )
+            with transaction.atomic():
+                payment = Payment.objects.create(
+                    driver=driver,
+                    amount=amount,
+                    payment_date=payment_date,
+                    effective_date=payment_date,
+                    receipt_number=receipt_number or "",
+                    description=description or "",
+                    idempotency_key=idempotency_key or None,
+                    status=PaymentStatus.RECEIVED,
+                    created_by=user,
+                )
         except IntegrityError:
-            # Another request may have created this payment first; return it.
             if idempotency_key:
                 existing = (
                     Payment.objects.filter(idempotency_key=idempotency_key).first()
                 )
                 if existing is not None:
-                    return existing
+                    if matches_existing_payment(existing):
+                        return existing
+                    raise FinancialError(
+                        "شناسه تکراری با پارامترهای متفاوت ثبت شده است.",
+                        "idempotency_key_conflict",
+                    )
             raise
         _split_into_allocations(
-            payment, driver, _target_periods(driver, target_period, periods_count), user, payment_date
+            payment,
+            driver,
+            _target_periods(driver, target_period, periods_count),
+            user,
+            payment_date,
+            auto_extend=True,
+        )
+        # Logged inside the transaction: a rolled-back payment leaves no entry,
+        # and an idempotent replay returns above without a misleading record.
+        log_activity(
+            actor=user,
+            action="payment_receive",
+            module=ActivityLog.Module.PAYMENTS,
+            description=f"ثبت پرداخت برای راننده «{driver.full_name}».",
+            target_type="payment",
+            target_id=payment.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            after_data={
+                "payment_id": payment.pk,
+                "driver_id": driver.pk,
+                "driver_code": driver.driver_code,
+                "amount": payment.amount,
+                "payment_date": payment.payment_date,
+                "receipt_number": payment.receipt_number,
+                "target_period": _period_label(*(target_period or (None, None))),
+                "status": payment.status,
+            },
         )
         return payment
 
@@ -312,14 +367,15 @@ def consume_credit(
     amount = _validate_amount(amount)
     consumption_id = consumption_id or uuid.uuid4().hex
     with transaction.atomic():
-        payment = source_allocation.payment
+        driver, payment, source_allocation = _lock_payment_allocation(
+            source_allocation.pk
+        )
         _touch_payment(payment)
         existing = AllocationConsumption.objects.filter(
             consumption_id=consumption_id
         ).first()
         if existing is not None:
             return existing
-        driver = payment.driver
         _ensure_writable_driver(driver)
         if source_allocation.allocation_type != AllocationType.CREDIT:
             raise FinancialError(
@@ -340,7 +396,7 @@ def consume_credit(
                 "مبلغ مصرف بیش از موجودی اعتبار یا نیاز دوره هدف است.",
                 "consumption_exceeds_balance",
             )
-        return AllocationConsumption.objects.create(
+        consumption = AllocationConsumption.objects.create(
             source_allocation=source_allocation,
             consumption_amount=amount,
             target_period_start=start,
@@ -350,6 +406,23 @@ def consume_credit(
             consumed_by=user,
             reason=reason or "",
         )
+        log_activity(
+            actor=user,
+            action="credit_consume",
+            module=ActivityLog.Module.PAYMENTS,
+            description=f"مصرف اعتبار برای راننده «{driver.full_name}».",
+            target_type="consumption",
+            target_id=consumption.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            after_data={
+                "consumption_id": consumption.pk,
+                "driver_id": driver.pk,
+                "amount": amount,
+                "target_period": _period_label(start, end),
+                "reason": reason or "",
+            },
+        )
+        return consumption
 
 
 # ---------------------------------------------------------------------------
@@ -357,12 +430,22 @@ def consume_credit(
 # ---------------------------------------------------------------------------
 def void_payment(*, payment: Payment, user, reason: str) -> Payment:
     reason = _require_reason(reason)
+    driver_id = payment.driver_id
     with transaction.atomic():
+        # Lock driver first to serialize concurrent financial operations
+        # on the same driver (§ race-condition guard).
+        driver = Driver.objects.select_for_update().get(pk=driver_id)
+        payment = Payment.objects.select_for_update().get(pk=payment.pk)
         _touch_payment(payment)
         payment.refresh_from_db()
         if payment.status != PaymentStatus.RECEIVED:
             raise FinancialError(
                 "فقط پرداخت دریافت‌شده قابل ابطال است.", "already_invalid"
+            )
+        if payment.refunds.exists():
+            raise FinancialError(
+                "پرداخت دارای برگشت پول است و قابل ابطال نیست.",
+                "payment_has_refunds",
             )
         now = timezone.now()
         _reverse_payment_children(payment, now, user, reason)
@@ -372,6 +455,22 @@ def void_payment(*, payment: Payment, user, reason: str) -> Payment:
         payment.void_reason = reason
         payment.save(
             update_fields=["status", "voided_at", "voided_by", "void_reason", "updated_at"]
+        )
+        log_activity(
+            actor=user,
+            action="payment_void",
+            module=ActivityLog.Module.PAYMENTS,
+            description=f"ابطال پرداخت برای راننده «{driver.full_name}».",
+            target_type="payment",
+            target_id=payment.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            before_data={"status": PaymentStatus.RECEIVED},
+            after_data={
+                "payment_id": payment.pk,
+                "amount": payment.amount,
+                "status": payment.status,
+                "reason": reason,
+            },
         )
         return payment
 
@@ -391,13 +490,37 @@ def correct_payment(
     periods_count: int = 1,
 ) -> Payment:
     reason = _require_reason(reason)
+    driver_id = payment.driver_id
+    driver_pks = {driver_id, new_driver.pk} if new_driver else {driver_id}
     with transaction.atomic():
+        locked_drivers = {
+            d.pk: d
+            for d in Driver.objects.select_for_update()
+            .filter(pk__in=driver_pks)
+            .order_by("pk")
+        }
+        driver = locked_drivers[driver_id]
+        new_driver_locked = locked_drivers.get(new_driver.pk) if new_driver else None
+        payment = Payment.objects.select_for_update().get(pk=payment.pk)
         _touch_payment(payment)
         payment.refresh_from_db()
         if payment.status != PaymentStatus.RECEIVED:
             raise FinancialError(
-                "فقط پرداخت دریافت‌شده قابل اصلاح است.", "already_invalid"
+                "فقط پرداخت دریافت شده قابل اصلاح است.", "already_invalid"
             )
+        if payment.refunds.exists():
+            raise FinancialError(
+                "پرداخت دارای برگشت پول است و قابل اصلاح نیست.",
+                "payment_has_refunds",
+            )
+        original_periods = list(
+            payment.allocations.filter(
+                reversed_at__isnull=True,
+                allocation_type=AllocationType.FEE_PERIOD,
+            )
+            .order_by("target_period_start", "id")
+            .values_list("target_period_start", "target_period_end")
+        )
         now = timezone.now()
         today = timezone.localdate()
         _reverse_payment_children(payment, now, user, reason)
@@ -414,7 +537,7 @@ def correct_payment(
                 "updated_at",
             ]
         )
-        driver = new_driver or payment.driver
+        driver = new_driver_locked or driver
         _ensure_writable_driver(driver)
         amount = _validate_amount(new_amount) if new_amount is not None else payment.amount
         cash_date = new_payment_date or payment.payment_date
@@ -425,16 +548,48 @@ def correct_payment(
             amount=amount,
             payment_date=cash_date,
             effective_date=today,  # D17: visibility = correction day, never backdated
+            description=payment.description,
             correction_of=payment,
             status=PaymentStatus.RECEIVED,
             created_by=user,
         )
+        target_periods = (
+            _target_periods(driver, target_period, periods_count)
+            if target_period is not None
+            else original_periods
+        )
         _split_into_allocations(
             replacement,
             driver,
-            _target_periods(driver, target_period, periods_count),
+            target_periods,
             user,
             today,
+            auto_extend=(
+                target_period is not None or driver.pk == payment.driver_id
+            ),
+        )
+        log_activity(
+            actor=user,
+            action="payment_correct",
+            module=ActivityLog.Module.PAYMENTS,
+            description=f"اصلاح پرداخت برای راننده «{driver.full_name}».",
+            target_type="payment",
+            target_id=replacement.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            before_data={
+                "payment_id": payment.pk,
+                "amount": payment.amount,
+                "payment_date": payment.payment_date,
+                "status": PaymentStatus.CORRECTED,
+            },
+            after_data={
+                "payment_id": replacement.pk,
+                "amount": replacement.amount,
+                "payment_date": replacement.payment_date,
+                "correction_of": payment.pk,
+                "status": replacement.status,
+                "reason": reason,
+            },
         )
         return replacement
 
@@ -451,9 +606,8 @@ def correct_allocation(
 ) -> PaymentAllocation:
     reason = _require_reason(reason)
     with transaction.atomic():
-        payment = allocation.payment
+        driver, payment, allocation = _lock_payment_allocation(allocation.pk)
         _touch_payment(payment)
-        allocation.refresh_from_db()
         if allocation.reversed_at is not None:
             raise FinancialError("این تخصیص قبلاً بازگردانده شده است.", "already_reversed")
         if allocation.allocation_type != AllocationType.FEE_PERIOD:
@@ -461,7 +615,6 @@ def correct_allocation(
                 "برای تخصیص اعتباری با مصرف وابسته از گردش کار W5-ext استفاده کنید.",
                 "use_credit_correction",
             )
-        driver = payment.driver
         start, end = _validate_allocation_period(
             driver, *new_target_period, allow_future=True
         )
@@ -474,7 +627,7 @@ def correct_allocation(
                 "مبلغ تخصیص بیش از مانده دوره هدف جدید است.",
                 "allocation_exceeds_period_balance",
             )
-        return PaymentAllocation.objects.create(
+        new_allocation = PaymentAllocation.objects.create(
             payment=payment,
             allocation_type=AllocationType.FEE_PERIOD,
             target_period_start=start,
@@ -484,6 +637,28 @@ def correct_allocation(
             correction_of=allocation,
             allocated_by=user,
         )
+        log_activity(
+            actor=user,
+            action="allocation_correct",
+            module=ActivityLog.Module.PAYMENTS,
+            description=f"اصلاح تخصیص پرداخت برای راننده «{driver.full_name}».",
+            target_type="allocation",
+            target_id=new_allocation.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            before_data={
+                "allocation_id": allocation.pk,
+                "target_period": _period_label(
+                    allocation.target_period_start, allocation.target_period_end
+                ),
+            },
+            after_data={
+                "allocation_id": new_allocation.pk,
+                "target_period": _period_label(start, end),
+                "amount": new_allocation.allocated_amount,
+                "reason": reason,
+            },
+        )
+        return new_allocation
 
 
 # ---------------------------------------------------------------------------
@@ -507,14 +682,12 @@ def correct_credit_allocation(
         raise FinancialError("مبلغ اعتبار نمی‌تواند منفی باشد.", "invalid_amount")
     new_credit_amount = _validate_amount(credit_value) if credit_value > ZERO else ZERO
     with transaction.atomic():
-        payment = allocation.payment
+        driver, payment, allocation = _lock_payment_allocation(allocation.pk)
         _touch_payment(payment)
-        allocation.refresh_from_db()
         if allocation.allocation_type != AllocationType.CREDIT:
             raise FinancialError("این تخصیص اعتباری نیست.", "invalid_source")
         if allocation.reversed_at is not None:
             raise FinancialError("این تخصیص قبلاً بازگردانده شده است.", "already_reversed")
-        driver = payment.driver
         now = timezone.now()
         today = timezone.localdate()
 
@@ -592,6 +765,28 @@ def correct_credit_allocation(
                     reason=item.get("reason", "") or "",
                 )
             )
+        log_activity(
+            actor=user,
+            action="credit_allocation_correct",
+            module=ActivityLog.Module.PAYMENTS,
+            description=(
+                f"اصلاح تخصیص اعتباری برای راننده «{driver.full_name}»."
+            ),
+            target_type="allocation",
+            target_id=allocation.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            before_data={
+                "allocation_id": allocation.pk,
+                "credit_amount": allocation.allocated_amount,
+            },
+            after_data={
+                "new_credit_allocation_id": new_credit.pk if new_credit else None,
+                "new_credit_amount": new_credit.allocated_amount if new_credit else 0,
+                "fee_allocations_count": len(new_fee),
+                "consumptions_count": len(new_consumptions),
+                "reason": reason,
+            },
+        )
         return {
             "reversed_allocation": allocation,
             "new_credit_allocation": new_credit,
@@ -609,6 +804,9 @@ def create_waiver(
     amount = _validate_amount(amount)
     reason = _require_reason(reason)
     with transaction.atomic():
+        # Lock driver row first to serialize concurrent financial operations
+        # on the same driver (§ race-condition guard).
+        driver = Driver.objects.select_for_update().get(pk=driver.pk)
         _touch_driver(driver)
         _ensure_writable_driver(driver)
         start, end = _validate_period(driver, *source_period)
@@ -617,7 +815,7 @@ def create_waiver(
             raise FinancialError(
                 "مبلغ بخشش بیش از مانده دوره مبدأ است.", "waiver_exceeds_balance"
             )
-        return Adjustment.objects.create(
+        waiver = Adjustment.objects.create(
             driver=driver,
             adjustment_type=AdjustmentType.WAIVER,
             amount=amount,
@@ -629,6 +827,22 @@ def create_waiver(
             effective_date=timezone.localdate(),
             created_by=user,
         )
+        log_activity(
+            actor=user,
+            action="waiver_create",
+            module=ActivityLog.Module.PAYMENTS,
+            description=f"ثبت بخشودگی برای راننده «{driver.full_name}».",
+            target_type="adjustment",
+            target_id=waiver.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            after_data={
+                "adjustment_id": waiver.pk,
+                "amount": waiver.amount,
+                "source_period": _period_label(start, end),
+                "reason": reason,
+            },
+        )
+        return waiver
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +860,9 @@ def create_transfer(
     amount = _validate_amount(amount)
     reason = _require_reason(reason)
     with transaction.atomic():
+        # Lock driver row first to serialize concurrent financial operations
+        # on the same driver (§ race-condition guard).
+        driver = Driver.objects.select_for_update().get(pk=driver.pk)
         _touch_driver(driver)
         _ensure_writable_driver(driver)
         s_start, s_end = _validate_period(driver, *source_period)
@@ -657,7 +874,7 @@ def create_transfer(
             raise FinancialError(
                 "مبلغ انتقال بیش از مانده دوره مبدأ است.", "transfer_exceeds_balance"
             )
-        return Adjustment.objects.create(
+        transfer = Adjustment.objects.create(
             driver=driver,
             adjustment_type=AdjustmentType.TRANSFER,
             amount=amount,
@@ -669,6 +886,23 @@ def create_transfer(
             effective_date=timezone.localdate(),
             created_by=user,
         )
+        log_activity(
+            actor=user,
+            action="transfer_create",
+            module=ActivityLog.Module.PAYMENTS,
+            description=f"انتقال بدهی برای راننده «{driver.full_name}».",
+            target_type="adjustment",
+            target_id=transfer.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            after_data={
+                "adjustment_id": transfer.pk,
+                "amount": transfer.amount,
+                "source_period": _period_label(s_start, s_end),
+                "destination_period": _period_label(d_start, d_end),
+                "reason": reason,
+            },
+        )
+        return transfer
 
 
 # ---------------------------------------------------------------------------
@@ -696,16 +930,179 @@ def _reverse_payment_children(payment, now, user, reason):
             _reverse_consumption(consumption, now, user, reason)
 
 
+def refund_payment(*, payment: Payment, amount, refund_date: date, user, reason: str):
+    """Record an append-only refund and rebuild affected allocation claims."""
+    amount = _validate_amount(amount)
+    if amount != amount.to_integral_value():
+        raise FinancialError("مبلغ برگشت باید عدد صحیح افغانی باشد.", "invalid_amount")
+    reason = _require_reason(reason)
+    today = timezone.localdate()
+    if refund_date > today:
+        raise FinancialError("تاریخ برگشت نمی‌تواند در آینده باشد.", "invalid_date")
+
+    driver_id = payment.driver_id
+    with transaction.atomic():
+        # Lock driver first to serialize concurrent financial operations
+        # on the same driver (§ race-condition guard).
+        driver = Driver.objects.select_for_update().get(pk=driver_id)
+        payment = Payment.objects.select_for_update().get(pk=payment.pk)
+        if payment.status != PaymentStatus.RECEIVED:
+            raise FinancialError(
+                "فقط پرداخت دریافت‌شده قابل برگشت پول است.", "already_invalid"
+            )
+
+        refunded_total = sum(
+            payment.refunds.values_list("amount", flat=True),
+            ZERO,
+        )
+        refundable = payment.amount - refunded_total
+        if amount > refundable:
+            raise FinancialError(
+                "مبلغ برگشت از مانده قابل‌برگشت پرداخت بیشتر است.",
+                "refund_exceeds_balance",
+            )
+
+        allocations = list(
+            payment.allocations.filter(reversed_at__isnull=True)
+            .prefetch_related("consumptions")
+            .order_by("created_at", "id")
+        )
+        allocated_total = sum((allocation.allocated_amount for allocation in allocations), ZERO)
+        unallocated = refundable - allocated_total
+        if unallocated < ZERO:
+            raise FinancialError(
+                "جمع تخصیص‌های فعال از مبلغ قابل‌برگشت بیشتر است.",
+                "invalid_allocation_state",
+            )
+
+        reduce_allocated = max(ZERO, amount - unallocated)
+        reductions = {}
+        remaining_reduction = reduce_allocated
+        for allocation in reversed(allocations):
+            reduction = min(allocation.allocated_amount, remaining_reduction)
+            reductions[allocation.id] = reduction
+            remaining_reduction -= reduction
+        if remaining_reduction > ZERO:
+            raise FinancialError(
+                "تخصیص‌های فعال با مانده قابل‌برگشت سازگار نیستند.",
+                "invalid_allocation_state",
+            )
+
+        refund = PaymentRefund.objects.create(
+            payment=payment,
+            amount=amount,
+            refund_date=refund_date,
+            effective_date=today,
+            reason=reason,
+            refunded_by=user,
+        )
+        log_activity(
+            actor=user,
+            action="payment_refund",
+            module=ActivityLog.Module.PAYMENTS,
+            description=f"ثبت برگشت پول برای راننده «{driver.full_name}».",
+            target_type="refund",
+            target_id=refund.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            after_data={
+                "refund_id": refund.pk,
+                "payment_id": payment.pk,
+                "amount": refund.amount,
+                "refund_date": refund.refund_date,
+                "reason": reason,
+            },
+        )
+
+        if reduce_allocated == ZERO:
+            return refund
+
+        now = timezone.now()
+        active_consumptions = {
+            allocation.id: list(
+                allocation.consumptions.filter(reversed_at__isnull=True).order_by(
+                    "consumed_at", "id"
+                )
+            )
+            for allocation in allocations
+            if allocation.allocation_type == AllocationType.CREDIT
+        }
+        for allocation in allocations:
+            _reverse_allocation(allocation, now, user, reason)
+            for consumption in active_consumptions.get(allocation.id, []):
+                _reverse_consumption(consumption, now, user, reason)
+
+        replacement_credits = {}
+        for allocation in allocations:
+            new_amount = allocation.allocated_amount - reductions.get(
+                allocation.id, ZERO
+            )
+            if new_amount <= ZERO:
+                continue
+            replacement = PaymentAllocation.objects.create(
+                payment=payment,
+                allocation_type=allocation.allocation_type,
+                target_period_start=allocation.target_period_start,
+                target_period_end=allocation.target_period_end,
+                allocated_amount=new_amount,
+                effective_date=today,
+                correction_of=allocation,
+                allocated_by=user,
+            )
+            if allocation.allocation_type == AllocationType.CREDIT:
+                replacement_credits[allocation.id] = replacement
+
+        for allocation_id, consumptions in active_consumptions.items():
+            replacement_credit = replacement_credits.get(allocation_id)
+            if replacement_credit is None:
+                continue
+            for consumption in consumptions:
+                ledger = DriverLedger(payment.driver)
+                available = ledger.source_available(replacement_credit)
+                need = ledger.period_state(
+                    consumption.target_period_start,
+                    consumption.target_period_end,
+                ).balance
+                restored_amount = min(
+                    consumption.consumption_amount,
+                    available,
+                    need,
+                )
+                if restored_amount <= ZERO:
+                    continue
+                AllocationConsumption.objects.create(
+                    source_allocation=replacement_credit,
+                    consumption_amount=restored_amount,
+                    target_period_start=consumption.target_period_start,
+                    target_period_end=consumption.target_period_end,
+                    effective_date=today,
+                    consumption_id=uuid.uuid4().hex,
+                    consumed_by=user,
+                    reason=consumption.reason,
+                )
+
+        return refund
+
+
 def reverse_adjustment(*, adjustment: Adjustment, amount, user, reason: str) -> Adjustment:
     amount = _validate_amount(amount)
     reason = _require_reason(reason)
-    if adjustment.adjustment_type not in (
-        AdjustmentType.WAIVER,
-        AdjustmentType.TRANSFER,
-    ):
-        raise FinancialError("بازگشت‌ها terminal هستند و قابل بازگشت نیستند.", "terminal_reversal")
+    adjustment_id = adjustment.pk
     with transaction.atomic():
-        driver = adjustment.driver
+        driver_id = Adjustment.objects.values_list("driver_id", flat=True).get(
+            pk=adjustment_id
+        )
+        # Lock driver first to serialize concurrent financial operations
+        # on the same driver (§ race-condition guard).
+        driver = Driver.objects.select_for_update().get(pk=driver_id)
+        adjustment = Adjustment.objects.select_for_update().get(pk=adjustment_id)
+        if adjustment.adjustment_type not in (
+            AdjustmentType.WAIVER,
+            AdjustmentType.TRANSFER,
+        ):
+            raise FinancialError(
+                "بازگشت‌ها terminal هستند و قابل بازگشت نیستند.",
+                "terminal_reversal",
+            )
         _touch_driver(driver)
         _ensure_writable_driver(driver)
         ledger = DriverLedger(driver)
@@ -736,7 +1133,7 @@ def reverse_adjustment(*, adjustment: Adjustment, amount, user, reason: str) -> 
                     "reversal_exceeds_remaining_transfer",
                 )
         is_transfer = adjustment.adjustment_type == AdjustmentType.TRANSFER
-        return Adjustment.objects.create(
+        reversal = Adjustment.objects.create(
             driver=driver,
             adjustment_type=(
                 AdjustmentType.TRANSFER_REVERSAL
@@ -757,6 +1154,25 @@ def reverse_adjustment(*, adjustment: Adjustment, amount, user, reason: str) -> 
             effective_date=timezone.localdate(),
             created_by=user,
         )
+        log_activity(
+            actor=user,
+            action="adjustment_reverse",
+            module=ActivityLog.Module.PAYMENTS,
+            description=(
+                f"برگشت {'انتقال' if is_transfer else 'بخشودگی'} برای راننده "
+                f"«{driver.full_name}»."
+            ),
+            target_type="adjustment",
+            target_id=reversal.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            after_data={
+                "reversal_id": reversal.pk,
+                "reverses_adjustment_id": adjustment.pk,
+                "amount": reversal.amount,
+                "reason": reason,
+            },
+        )
+        return reversal
 
 
 # ---------------------------------------------------------------------------
@@ -765,10 +1181,17 @@ def reverse_adjustment(*, adjustment: Adjustment, amount, user, reason: str) -> 
 def unsettle_and_reverse(*, adjustment: Adjustment, amount, user, reason: str) -> Adjustment:
     amount = _validate_amount(amount)
     reason = _require_reason(reason)
-    if adjustment.adjustment_type != AdjustmentType.TRANSFER:
-        raise FinancialError("W9 فقط برای بازگشت انتقال است.", "invalid_operation")
+    adjustment_id = adjustment.pk
     with transaction.atomic():
-        driver = adjustment.driver
+        driver_id = Adjustment.objects.values_list("driver_id", flat=True).get(
+            pk=adjustment_id
+        )
+        # Lock driver row first to serialize concurrent financial operations
+        # on the same driver (§ race-condition guard).
+        driver = Driver.objects.select_for_update().get(pk=driver_id)
+        adjustment = Adjustment.objects.select_for_update().get(pk=adjustment_id)
+        if adjustment.adjustment_type != AdjustmentType.TRANSFER:
+            raise FinancialError("W9 فقط برای بازگشت انتقال است.", "invalid_operation")
         _touch_driver(driver)
         _ensure_writable_driver(driver)
         dest = (
@@ -784,14 +1207,62 @@ def unsettle_and_reverse(*, adjustment: Adjustment, amount, user, reason: str) -
                 target_period_start=dest[0],
                 target_period_end=dest[1],
                 reversed_at__isnull=True,
-            ).select_related("payment")
+            ).select_related("payment").order_by("id")
         )
         for alloc in fee_allocations:
             _reverse_allocation(alloc, now, user, reason)
-        return reverse_adjustment(
+        credit_remainders = []
+        for alloc in fee_allocations:
+            remaining = alloc.allocated_amount
+            open_own = DriverLedger(driver).period_state(*dest).remaining_own
+            fee_amount = min(open_own, remaining)
+            if fee_amount > ZERO:
+                PaymentAllocation.objects.create(
+                    payment=alloc.payment,
+                    allocation_type=AllocationType.FEE_PERIOD,
+                    target_period_start=dest[0],
+                    target_period_end=dest[1],
+                    allocated_amount=fee_amount,
+                    effective_date=today,
+                    correction_of=alloc,
+                    allocated_by=user,
+                )
+                remaining -= fee_amount
+            if remaining > ZERO:
+                credit_remainders.append((alloc, remaining))
+        reversal = reverse_adjustment(
             adjustment=adjustment, amount=amount, user=user, reason=reason
         )
-
+        for alloc, credit_amount in credit_remainders:
+            PaymentAllocation.objects.create(
+                payment=alloc.payment,
+                allocation_type=AllocationType.CREDIT,
+                target_period_start=None,
+                target_period_end=None,
+                allocated_amount=credit_amount,
+                effective_date=today,
+                correction_of=alloc,
+                allocated_by=user,
+            )
+        log_activity(
+            actor=user,
+            action="transfer_unsettle_reverse",
+            module=ActivityLog.Module.PAYMENTS,
+            description=(
+                f"بازگشایی تسویه مقصد و برگشت انتقال برای راننده "
+                f"«{driver.full_name}»."
+            ),
+            target_type="adjustment",
+            target_id=reversal.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            after_data={
+                "reversal_id": reversal.pk,
+                "reverses_adjustment_id": adjustment.pk,
+                "amount": amount,
+                "reason": reason,
+            },
+        )
+        return reversal
 
 # ---------------------------------------------------------------------------
 # W10 — change fee_start_date (dedicated endpoint, reason required)
@@ -799,8 +1270,8 @@ def unsettle_and_reverse(*, adjustment: Adjustment, amount, user, reason: str) -
 def change_fee_start_date(*, driver: Driver, requested: date, user, reason: str):
     reason = _require_reason(reason)
     with transaction.atomic():
+        driver = Driver.objects.select_for_update().get(pk=driver.pk)
         _touch_driver(driver)
-        driver.refresh_from_db()
         effective = compute_effective_anchor(driver, requested)
         old = driver.fee_start_date
         history = DriverFeeHistory.objects.create(
@@ -813,6 +1284,21 @@ def change_fee_start_date(*, driver: Driver, requested: date, user, reason: str)
         )
         driver.fee_start_date = requested  # display mirror of latest requested
         driver.save(update_fields=["fee_start_date", "updated_at"])
+        log_activity(
+            actor=user,
+            action="fee_start_date_change",
+            module=ActivityLog.Module.PAYMENTS,
+            description=f"تغییر تاریخ شروع فیس راننده «{driver.full_name}».",
+            target_type="driver",
+            target_id=driver.pk,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            before_data={"fee_start_date": old},
+            after_data={
+                "requested_fee_start_date": requested,
+                "effective_fee_start_date": effective,
+                "reason": reason,
+            },
+        )
         return history
 
 
@@ -827,9 +1313,26 @@ def change_fee_schedule(*, amount, effective_from: date, user, reason: str) -> F
             "تاریخ اثر برنامه فیس نمی‌تواند گذشته باشد (بدون backdate).", "no_backdate"
         )
     with transaction.atomic():
-        return FeeSchedule.objects.create(
+        list(Driver.objects.select_for_update().order_by("pk"))
+        lock_current_fee_schedule()
+        schedule = FeeSchedule.objects.create(
             amount=amount,
             effective_from=effective_from,
             reason=reason,
             created_by=user,
         )
+        log_activity(
+            actor=user,
+            action="fee_schedule_change",
+            module=ActivityLog.Module.PAYMENTS,
+            description="تغییر مبلغ فیس دوره‌ای.",
+            target_type="fee_schedule",
+            target_id=schedule.pk,
+            target_label=str(schedule.amount),
+            after_data={
+                "amount": schedule.amount,
+                "effective_from": schedule.effective_from,
+                "reason": reason,
+            },
+        )
+        return schedule

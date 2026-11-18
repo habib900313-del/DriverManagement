@@ -17,12 +17,17 @@ export function StatusBadge({
         className,
       )}
     >
-      <span
-        className={cn(
-          'size-1.5 rounded-full',
-          active ? 'bg-emerald-500' : 'bg-slate-400',
+      <span className="relative flex size-1.5">
+        {active && (
+          <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75" />
         )}
-      />
+        <span
+          className={cn(
+            'relative inline-flex size-1.5 rounded-full',
+            active ? 'bg-emerald-500' : 'bg-slate-400',
+          )}
+        />
+      </span>
       {active ? 'فعال' : 'غیرفعال'}
     </span>
   )

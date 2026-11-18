@@ -3,6 +3,8 @@ from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
+from .models import ActivityLog
+
 
 class LoginSerializer(serializers.Serializer):
     username = serializers.CharField(
@@ -37,6 +39,17 @@ class ManagedUserCreateSerializer(serializers.Serializer):
     password_confirmation = serializers.CharField(write_only=True, trim_whitespace=False)
     role = serializers.ChoiceField(choices=("admin", "guest"))
 
+    def to_internal_value(self, data):
+        unknown_fields = set(data) - set(self.fields)
+        if unknown_fields:
+            raise serializers.ValidationError(
+                {
+                    field: ["این فیلد قابل تنظیم نیست."]
+                    for field in sorted(unknown_fields)
+                }
+            )
+        return super().to_internal_value(data)
+
     def validate_username(self, username):
         if get_user_model().objects.filter(username=username).exists():
             raise serializers.ValidationError("این نام کاربری قبلاً استفاده شده است.")
@@ -54,3 +67,98 @@ class ManagedUserCreateSerializer(serializers.Serializer):
         except DjangoValidationError as exc:
             raise serializers.ValidationError({"password": list(exc.messages)})
         return attrs
+
+
+class ManagedUserUpdateSerializer(serializers.Serializer):
+    """Editable fields for non-superuser accounts."""
+
+    full_name = serializers.CharField(max_length=150, required=False)
+    role = serializers.ChoiceField(choices=("admin", "guest"), required=False)
+    is_active = serializers.BooleanField(required=False)
+
+    def to_internal_value(self, data):
+        unknown_fields = set(data) - set(self.fields)
+        if unknown_fields:
+            raise serializers.ValidationError(
+                {
+                    field: ["این فیلد قابل ویرایش نیست."]
+                    for field in sorted(unknown_fields)
+                }
+            )
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        if not attrs:
+            raise serializers.ValidationError("حداقل یک فیلد برای ویرایش لازم است.")
+        return attrs
+
+
+class ManagedUserPasswordResetSerializer(serializers.Serializer):
+    new_password = serializers.CharField(
+        write_only=True,
+        trim_whitespace=False,
+        style={"input_type": "password"},
+    )
+    password_confirmation = serializers.CharField(
+        write_only=True,
+        trim_whitespace=False,
+        style={"input_type": "password"},
+    )
+
+    def to_internal_value(self, data):
+        unknown_fields = set(data) - set(self.fields)
+        if unknown_fields:
+            raise serializers.ValidationError(
+                {
+                    field: ["این فیلد قابل تنظیم نیست."]
+                    for field in sorted(unknown_fields)
+                }
+            )
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        if attrs["new_password"] != attrs["password_confirmation"]:
+            raise serializers.ValidationError(
+                {"password_confirmation": "رمزهای عبور یکسان نیستند."}
+            )
+        try:
+            validate_password(attrs["new_password"], user=self.context["user"])
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({"new_password": list(exc.messages)})
+        return attrs
+
+
+class ActivityLogSerializer(serializers.ModelSerializer):
+    """Read-only representation for the activity-log list."""
+
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = ActivityLog
+        fields = [
+            "id",
+            "timestamp",
+            "actor_username",
+            "action",
+            "module",
+            "description",
+            "target_type",
+            "target_id",
+            "target_label",
+            "status",
+            "status_label",
+            "ip_address",
+        ]
+        read_only_fields = fields
+
+
+class ActivityLogDetailSerializer(ActivityLogSerializer):
+    """List fields plus the payloads needed for the comparison view."""
+
+    class Meta(ActivityLogSerializer.Meta):
+        fields = ActivityLogSerializer.Meta.fields + [
+            "metadata",
+            "before_data",
+            "after_data",
+        ]
+        read_only_fields = fields

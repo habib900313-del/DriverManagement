@@ -27,7 +27,7 @@ let nextId = 1
 const styles: Record<ToastType, string> = {
   success: 'border-emerald-200 bg-emerald-50 text-emerald-900',
   error: 'border-rose-200 bg-rose-50 text-rose-900',
-  info: 'border-sky-200 bg-sky-50 text-sky-900',
+  info: 'border-brand-200 bg-brand-50 text-brand-900',
 }
 
 const icons: Record<ToastType, ReactNode> = {
@@ -92,7 +92,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           <div
             key={toast.id}
             className={cn(
-              'pointer-events-auto flex items-start gap-2.5 rounded-xl border px-3.5 py-3 text-sm shadow-lg shadow-slate-900/5',
+              'animate-slide-in-left pointer-events-auto flex items-start gap-2.5 rounded-xl border px-3.5 py-3 text-sm shadow-lg backdrop-blur',
               styles[toast.type],
             )}
           >

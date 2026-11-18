@@ -64,6 +64,101 @@ export function isValidIsoDate(value: string): boolean {
   )
 }
 
+/**
+ * Validate a report date range. Empty bounds mean "no filter"; ISO dates
+ * compare correctly as strings. ``asOf`` is an optional inclusive upper bound.
+ * Returns a Persian validation message, or ``null`` when the range is valid.
+ */
+export function validateDateRange(
+  from: string,
+  to: string,
+  asOf?: string,
+): string | null {
+  if (from && to && from > to) {
+    return 'تاریخ شروع نباید بعد از تاریخ پایان باشد.'
+  }
+  if (to && asOf && to > asOf) {
+    return 'تاریخ پایان نباید بعد از تاریخ محاسبه باشد.'
+  }
+  return null
+}
+
+function addGregorianMonths(value: string, months: number): string | null {
+  if (!isValidIsoDate(value)) return null
+  const [year, month, day] = value.split('-').map(Number)
+  const totalMonths = year * 12 + month - 1 + months
+  const targetYear = Math.floor(totalMonths / 12)
+  const targetMonth = (totalMonths % 12) + 1
+  const lastDay = new Date(Date.UTC(targetYear, targetMonth, 0)).getUTCDate()
+  return `${targetYear}-${pad2(targetMonth)}-${pad2(Math.min(day, lastDay))}`
+}
+
+export function isValidQuarterPeriod(
+  anchor: string,
+  start: string,
+  end: string,
+): boolean {
+  if (!isValidIsoDate(anchor) || !isValidIsoDate(start) || !isValidIsoDate(end)) {
+    return false
+  }
+
+  const [anchorYear, anchorMonth] = anchor.split('-').map(Number)
+  const [startYear, startMonth] = start.split('-').map(Number)
+  const monthOffset = (startYear - anchorYear) * 12 + startMonth - anchorMonth
+  if (monthOffset < 0 || monthOffset % 3 !== 0) return false
+
+  const expectedStart = addGregorianMonths(anchor, monthOffset)
+  const nextStart = addGregorianMonths(anchor, monthOffset + 3)
+  if (!expectedStart || !nextStart || expectedStart !== start) return false
+
+  const nextDate = new Date(`${nextStart}T00:00:00Z`)
+  nextDate.setUTCDate(nextDate.getUTCDate() - 1)
+  const expectedEnd = `${nextDate.getUTCFullYear()}-${pad2(
+    nextDate.getUTCMonth() + 1,
+  )}-${pad2(nextDate.getUTCDate())}`
+  return end === expectedEnd
+}
+
+export function addJalaliMonths(value: string, months: number): string | null {
+  const jalali = isoToJalali(value)
+  if (!jalali || !Number.isInteger(months)) return null
+  const target = shiftJalaliMonth(jalali.jy, jalali.jm, months)
+  const day = Math.min(
+    jalali.jd,
+    jalaaliMonthLength(target.jy, target.jm),
+  )
+  return jalaliToIso(target.jy, target.jm, day)
+}
+
+export function jalaliQuarterEnd(start: string): string | null {
+  const nextStart = addJalaliMonths(start, 3)
+  if (!nextStart) return null
+  const [year, month, day] = nextStart.split('-').map(Number)
+  const end = new Date(Date.UTC(year, month - 1, day - 1))
+  return `${end.getUTCFullYear()}-${pad2(end.getUTCMonth() + 1)}-${pad2(
+    end.getUTCDate(),
+  )}`
+}
+
+export function isValidJalaliQuarterPeriod(
+  anchor: string,
+  start: string,
+  end: string,
+): boolean {
+  const anchorDate = isoToJalali(anchor)
+  const startDate = isoToJalali(start)
+  if (!anchorDate || !startDate || !isValidIsoDate(end)) return false
+
+  const monthOffset =
+    (startDate.jy - anchorDate.jy) * 12 + startDate.jm - anchorDate.jm
+  if (monthOffset < 0 || monthOffset % 3 !== 0) return false
+
+  return (
+    addJalaliMonths(anchor, monthOffset) === start &&
+    jalaliQuarterEnd(start) === end
+  )
+}
+
 export interface JalaliDate {
   jy: number
   jm: number

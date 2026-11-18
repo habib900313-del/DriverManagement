@@ -79,6 +79,7 @@ class Payment(AppendOnlyModel):
     receipt_number = models.CharField(
         max_length=50, blank=True, default="", verbose_name="شماره رسید"
     )
+    description = models.TextField(blank=True, default="", verbose_name="توضیحات")
     idempotency_key = models.CharField(
         max_length=64, unique=True, null=True, blank=True
     )
@@ -177,6 +178,52 @@ class Payment(AppendOnlyModel):
     def is_void(self) -> bool:
         """Derived only (D7): status is the single source of truth."""
         return self.status != PaymentStatus.RECEIVED
+
+
+class PaymentRefund(AppendOnlyModel):
+    """Immutable cash refund against a received payment."""
+
+    payment = models.ForeignKey(
+        Payment,
+        on_delete=models.PROTECT,
+        related_name="refunds",
+        verbose_name="پرداخت",
+    )
+    amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        validators=[validate_whole_afn],
+        verbose_name="مبلغ برگشت (AFN)",
+    )
+    refund_date = models.DateField(
+        validators=[validate_not_future_date],
+        verbose_name="تاریخ برگشت",
+    )
+    effective_date = models.DateField(
+        verbose_name="تاریخ اثر در گزارش‌ها",
+        help_text="Refund از تاریخ ثبت عملیاتی در Ledger اثر می‌گذارد.",
+    )
+    reason = models.TextField(verbose_name="دلیل برگشت")
+    refunded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="payment_refunds",
+        verbose_name="کاربر ثبت‌کننده",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "برگشت پول"
+        verbose_name_plural = "برگشت پول‌ها"
+        indexes = [
+            models.Index(fields=["payment", "refund_date"], name="refund_pay_date_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(amount__gt=0),
+                name="refund_amount_positive",
+            ),
+        ]
 
 
 class PaymentAllocation(AppendOnlyModel):

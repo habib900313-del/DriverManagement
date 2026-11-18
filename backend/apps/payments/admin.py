@@ -13,6 +13,7 @@ from .models import (
     FeeSchedule,
     Payment,
     PaymentAllocation,
+    PaymentRefund,
 )
 
 
@@ -46,6 +47,12 @@ class PaymentAllocationAdmin(ReadOnlyAdmin):
         "reversed_at",
     )
     list_filter = ("allocation_type",)
+
+
+@admin.register(PaymentRefund)
+class PaymentRefundAdmin(ReadOnlyAdmin):
+    list_display = ("id", "payment", "amount", "refund_date", "refunded_by", "created_at")
+    list_filter = ("refund_date",)
 
 
 @admin.register(AllocationConsumption)

@@ -1,8 +1,14 @@
-import { useMemo, useState } from 'react'
-import { CalendarIcon } from './icons'
+import { useEffect, useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
+import { CalendarIcon, PencilIcon } from './icons'
+import { Button } from './ui/Button'
+import { Spinner } from './ui/Spinner'
 import { cn } from '../lib/cn'
 import { formatJalaliShort, toPersianDigits } from '../lib/dates'
-import type { DriverPeriodCoverage, PeriodCoverageRow } from '../types/financial'
+import { fetchPayment } from '../lib/api'
+import { getErrorMessage, isAbortError } from '../lib/errors'
+import { getPaymentCorrectionDisabledReason } from '../lib/payments'
+import type { DriverPeriodCoverage, PaymentListItem, PeriodCoverageRow } from '../types/financial'
 
 const STATUS_STYLE: Record<
   PeriodCoverageRow['status'],
@@ -29,7 +35,7 @@ const STATUS_STYLE: Record<
 }
 
 function StatusBadge({ row }: { row: PeriodCoverageRow }) {
-  const style = STATUS_STYLE[row.status]
+  const style = getPeriodStyle(row)
   return (
     <span
       className={cn(
@@ -42,14 +48,110 @@ function StatusBadge({ row }: { row: PeriodCoverageRow }) {
   )
 }
 
-export function DriverPeriodPayments({ coverage }: { coverage: DriverPeriodCoverage | null }) {
+function getPeriodStyle(row: PeriodCoverageRow) {
+  if (row.is_future) {
+    if (row.status === 'paid') {
+      return { ...STATUS_STYLE.paid, label: 'پیش‌پرداخت‌شده' }
+    }
+    if (row.status === 'partial') {
+      return { ...STATUS_STYLE.partial, label: 'پیش‌پرداخت جزئی' }
+    }
+    return {
+      row: 'bg-brand-50/70',
+      badge: 'bg-brand-100 text-brand-700',
+      label: 'در انتظار شروع',
+      bar: 'bg-brand-300',
+    }
+  }
+
+  if (row.is_overdue && Number(row.remaining) > 0) {
+    return {
+      row: 'bg-rose-50/70',
+      badge: 'bg-rose-100 text-rose-700',
+      label: 'معوق',
+      bar: 'bg-rose-400',
+    }
+  }
+
+  const style = STATUS_STYLE[row.status]
+  if (!row.is_current) return style
+
+  return {
+    ...style,
+    row: row.status === 'paid' ? 'bg-emerald-50/70' : 'bg-brand-50/70',
+    label:
+      row.status === 'paid'
+        ? 'دوره جاری — تسویه‌شده'
+        : row.status === 'partial'
+          ? 'دوره جاری — پرداخت جزئی'
+          : 'دوره جاری — پرداخت‌نشده',
+  }
+}
+
+export function DriverPeriodPayments({
+  coverage,
+  driverId,
+  canManage = false,
+}: {
+  coverage: DriverPeriodCoverage | null
+  driverId: number
+  canManage?: boolean
+}) {
   const [selectedStart, setSelectedStart] = useState<string | null>(null)
+  const [paymentDetails, setPaymentDetails] = useState<{
+    periodStart: string
+    byId: Record<number, PaymentListItem>
+  } | null>(null)
+  const [paymentLoadError, setPaymentLoadError] = useState<{
+    periodStart: string
+    message: string
+  } | null>(null)
+  const [paymentRetry, setPaymentRetry] = useState(0)
 
   const rows = useMemo(() => coverage?.periods || [], [coverage])
   const selected = useMemo(
     () => rows.find((row) => row.start === selectedStart) || null,
     [rows, selectedStart],
   )
+
+  useEffect(() => {
+    if (!selected || selected.allocations.length === 0) {
+      return
+    }
+
+    const controller = new AbortController()
+    const paymentIds = [...new Set(selected.allocations.map((allocation) => allocation.payment_id))]
+    Promise.all(
+      paymentIds.map(async (paymentId) => [paymentId, await fetchPayment(paymentId, controller.signal)] as const),
+    )
+      .then((results) => {
+        setPaymentDetails({
+          periodStart: selected.start,
+          byId: Object.fromEntries(results),
+        })
+      })
+      .catch((cause) => {
+        if (!isAbortError(cause)) {
+          setPaymentLoadError({
+            periodStart: selected.start,
+            message: getErrorMessage(cause),
+          })
+        }
+      })
+
+    return () => controller.abort()
+  }, [selected, paymentRetry])
+
+  const paymentsLoading = Boolean(
+    selected &&
+      selected.allocations.length > 0 &&
+      paymentDetails?.periodStart !== selected.start &&
+      paymentLoadError?.periodStart !== selected.start,
+  )
+  const paymentsError =
+    selected && paymentLoadError?.periodStart === selected.start
+      ? paymentLoadError.message
+      : null
 
   if (!coverage || rows.length === 0) {
     return (
@@ -91,11 +193,12 @@ export function DriverPeriodPayments({ coverage }: { coverage: DriverPeriodCover
                 مانده
               </th>
               <th className="px-3 py-2 text-right font-medium">وضعیت</th>
+              <th className="px-3 py-2 text-right font-medium">جزئیات</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
             {rows.map((row) => {
-              const style = STATUS_STYLE[row.status]
+              const style = getPeriodStyle(row)
               const isSelected = row.start === selectedStart
               return (
                 <tr
@@ -104,7 +207,9 @@ export function DriverPeriodPayments({ coverage }: { coverage: DriverPeriodCover
                   className={cn(
                     'cursor-pointer transition hover:bg-slate-50',
                     style.row,
-                    isSelected && 'ring-2 ring-inset ring-blue-400',
+                    row.is_overdue && Number(row.remaining) > 0 && 'border-s-2 border-rose-400',
+                    row.is_current && 'border-s-2 border-brand-400',
+                    isSelected && 'ring-2 ring-inset ring-brand-400',
                   )}
                 >
                   <td className="px-3 py-2">
@@ -114,8 +219,8 @@ export function DriverPeriodPayments({ coverage }: { coverage: DriverPeriodCover
                     <span className="mt-0.5 flex items-center gap-1 text-[10px] text-slate-400">
                       {row.is_future && <span>آینده</span>}
                       {row.is_current && <span>دوره جاری</span>}
-                      {row.is_overdue && row.remaining !== '0.00' && (
-                        <span className="text-rose-500">معوق</span>
+                      {row.is_overdue && Number(row.remaining) > 0 && (
+                        <span className="text-rose-500">سررسید گذشته</span>
                       )}
                     </span>
                   </td>
@@ -143,6 +248,21 @@ export function DriverPeriodPayments({ coverage }: { coverage: DriverPeriodCover
                       />
                     </span>
                   </td>
+                  <td className="px-3 py-2">
+                    {row.allocations.length > 0 && (
+                      <button
+                        type="button"
+                        aria-expanded={isSelected}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setSelectedStart(isSelected ? null : row.start)
+                        }}
+                        className="whitespace-nowrap rounded-lg px-2 py-1 text-[11px] font-medium text-brand-700 transition hover:bg-brand-50"
+                      >
+                        {isSelected ? 'بستن جزئیات' : 'مشاهده پرداخت‌ها'}
+                      </button>
+                    )}
+                  </td>
                 </tr>
               )
             })}
@@ -169,25 +289,91 @@ export function DriverPeriodPayments({ coverage }: { coverage: DriverPeriodCover
           {selected.allocations.length === 0 && selected.consumptions.length === 0 ? (
             <p className="text-xs text-slate-500">برای این دوره پرداختی ثبت نشده است.</p>
           ) : (
-            <ul className="space-y-1.5 text-xs text-slate-600">
-              {selected.allocations.map((allocation) => (
-                <li
-                  key={`a-${allocation.id}`}
-                  className="flex flex-wrap items-center justify-between gap-2 rounded border border-slate-200 bg-white px-2.5 py-1.5"
-                >
-                  <span>
-                    پرداخت #{toPersianDigits(allocation.payment_id.toString())} —{' '}
-                    {formatJalaliShort(allocation.payment_date)}
-                    {allocation.receipt_number ? ` — رسید ${allocation.receipt_number}` : ''}
-                  </span>
-                  <span className="font-mono" dir="ltr">
-                    {toPersianDigits(allocation.amount)} AFN
-                    {allocation.reversed_at ? (
-                      <span className="mr-2 text-rose-500">بازگردانده‌شده</span>
-                    ) : null}
-                  </span>
-                </li>
-              ))}
+            <div className="space-y-2">
+              {paymentsLoading && (
+                <p className="flex items-center gap-2 text-xs text-slate-500">
+                  <Spinner className="size-4" />
+                  در حال بارگذاری جزئیات پرداخت‌ها…
+                </p>
+              )}
+              {paymentsError && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700" role="alert">
+                  <span>جزئیات پرداخت بارگذاری نشد: {paymentsError}</span>
+                  <button
+                    type="button"
+                    className="font-semibold underline underline-offset-2"
+                    onClick={() => {
+                      setPaymentLoadError(null)
+                      setPaymentRetry((current) => current + 1)
+                    }}
+                  >
+                    تلاش دوباره
+                  </button>
+                </div>
+              )}
+              <ul className="space-y-1.5 text-xs text-slate-600">
+              {selected.allocations.map((allocation) => {
+                const payment =
+                  paymentDetails?.periodStart === selected.start
+                    ? paymentDetails.byId[allocation.payment_id]
+                    : undefined
+                const disabledReason = payment
+                  ? getPaymentCorrectionDisabledReason(payment)
+                  : paymentsError
+                    ? 'جزئیات پرداخت برای بررسی امکان اصلاح در دسترس نیست.'
+                    : 'در حال بررسی وضعیت پرداخت…'
+                const correctionUrl =
+                  `/financial/payments/${allocation.payment_id}/correct` +
+                  `?returnTo=${encodeURIComponent(`/drivers/${driverId}`)}`
+
+                return (
+                  <li
+                    key={`a-${allocation.id}`}
+                    className="flex flex-col gap-2 rounded border border-slate-200 bg-white px-2.5 py-2 sm:flex-row sm:items-center sm:justify-between"
+                  >
+                    <span className="min-w-0">
+                      پرداخت #{toPersianDigits(allocation.payment_id.toString())} —{' '}
+                      {formatJalaliShort(allocation.payment_date)}
+                      {allocation.receipt_number ? ` — رسید ${allocation.receipt_number}` : ''}
+                      {allocation.description ? ` — ${allocation.description}` : ''}
+                      {allocation.reversed_at ? (
+                        <span className="mr-2 text-rose-500">بازگردانده‌شده</span>
+                      ) : null}
+                      <span className="mr-2 font-mono" dir="ltr">
+                        {toPersianDigits(allocation.amount)} AFN
+                      </span>
+                    </span>
+                    {canManage && (
+                      <div className="flex shrink-0 flex-wrap items-center gap-2">
+                        {payment && !disabledReason ? (
+                          <Link
+                            to={correctionUrl}
+                            className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 text-xs font-semibold text-slate-700 shadow-xs transition hover:border-slate-300 hover:bg-slate-50"
+                          >
+                            <PencilIcon className="size-3.5" />
+                            اصلاح پرداخت
+                          </Link>
+                        ) : (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            disabled
+                            title={disabledReason ?? undefined}
+                          >
+                            اصلاح پرداخت
+                          </Button>
+                        )}
+                        {disabledReason && !paymentsLoading && (
+                          <span className="max-w-56 text-[11px] leading-4 text-amber-700">
+                            {disabledReason}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </li>
+                )
+              })}
               {selected.consumptions.map((consumption) => (
                 <li
                   key={`c-${consumption.id}`}
@@ -205,7 +391,8 @@ export function DriverPeriodPayments({ coverage }: { coverage: DriverPeriodCover
                   </span>
                 </li>
               ))}
-            </ul>
+              </ul>
+            </div>
           )}
         </div>
       )}

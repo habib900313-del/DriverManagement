@@ -11,13 +11,22 @@ from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError, transaction
 from django.test import override_settings
+from django.utils import timezone
 from decimal import Decimal as D
 from PIL import Image
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
 from apps.payments import services
-from apps.payments.models import AllocationType, OnlinePayment, Payment
+from apps.documents.models import Document
+from apps.payments.models import (
+    AllocationType,
+    OnlinePayment,
+    Payment,
+    PaymentAllocation,
+    PaymentRefund,
+)
+from apps.payments.periods import fee_for_period, period_for_start
 
 from .models import Driver, DriverFeeHistory
 
@@ -65,6 +74,15 @@ class DriverApiTests(APITestCase):
         )
         self.client.force_authenticate(user=self.user)
 
+    def _initial_payment_payload(self, driver_code, amount):
+        return driver_payload(
+            driver_code=driver_code,
+            initial_payment_amount=str(amount),
+            initial_payment_date="2026-11-10",
+            initial_payment_period_start="2026-11-09",
+            initial_payment_idempotency_key=f"initial-{driver_code}",
+        )
+
     # ------------------------------------------------------------------
     # Authentication and permissions
     # ------------------------------------------------------------------
@@ -89,6 +107,259 @@ class DriverApiTests(APITestCase):
         response = self.client.post("/api/drivers/", driver_payload(), format="json")
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_admin_can_create_update_and_deactivate_driver(self):
+        admin = get_user_model().objects.create_user(
+            username="driver-admin", password="pass123", is_staff=True
+        )
+        self.client.force_authenticate(user=admin)
+
+        response = self.client.post("/api/drivers/", driver_payload(), format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        driver_id = response.data["id"]
+
+        response = self.client.patch(
+            f"/api/drivers/{driver_id}/",
+            {"address": "آدرس تازه"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        response = self.client.post(
+            f"/api/drivers/{driver_id}/status/",
+            {"status": False},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(Driver.objects.get(pk=driver_id).status)
+
+    def test_authenticated_staff_admin_can_create_driver_without_superuser_flag(self):
+        password = "StrongPass-2026!"
+        admin = get_user_model().objects.create_user(
+            username="live-admin",
+            password=password,
+            is_staff=True,
+            is_superuser=False,
+            is_active=True,
+        )
+        client = APIClient()
+        self.assertTrue(client.login(username=admin.username, password=password))
+
+        response = client.post("/api/drivers/", driver_payload(), format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(
+            client.get("/api/users/").status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_driver_creation_without_initial_payment_creates_no_payment(self):
+        response = self.client.post(
+            "/api/drivers/", driver_payload(), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertFalse(Payment.objects.filter(driver_id=response.data["id"]).exists())
+
+    def test_zero_initial_payment_creates_no_payment(self):
+        response = self.client.post(
+            "/api/drivers/",
+            driver_payload(initial_payment_amount="0"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertFalse(Payment.objects.filter(driver_id=response.data["id"]).exists())
+
+    def test_full_initial_payment_is_allocated_to_selected_period_and_coverage(self):
+        period_start = date(2026, 11, 9)
+        amount = fee_for_period(period_start)
+        response = self.client.post(
+            "/api/drivers/",
+            self._initial_payment_payload("D-INIT-FULL", amount),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        payment = Payment.objects.get(driver_id=response.data["id"])
+        self.assertEqual(payment.amount, amount)
+        driver = Driver.objects.get(pk=response.data["id"])
+        self.assertEqual(driver.period_calendar, Driver.PERIOD_CALENDAR_JALALI)
+        allocation = payment.allocations.get()
+        self.assertEqual(allocation.allocation_type, AllocationType.FEE_PERIOD)
+        self.assertEqual(allocation.target_period_start, period_start)
+        self.assertEqual(
+            allocation.target_period_end,
+            period_for_start(driver, period_start)[1],
+        )
+        self.assertEqual(allocation.target_period_end, date(2027, 2, 6))
+
+        coverage_response = self.client.get(
+            f"/api/drivers/{response.data['id']}/period-coverage/"
+            "?as_of=2026-11-15"
+        )
+        self.assertEqual(coverage_response.status_code, status.HTTP_200_OK)
+        period = next(
+            item
+            for item in coverage_response.data["periods"]
+            if item["start"] == period_start.isoformat()
+        )
+        self.assertEqual(period["paid"], str(amount))
+        self.assertEqual(period["remaining"], "0.00")
+        self.assertEqual(period["status"], "paid")
+
+    def test_partial_initial_payment_updates_period_coverage(self):
+        fee = fee_for_period(date(2026, 11, 9))
+        amount = fee - D("1")
+        response = self.client.post(
+            "/api/drivers/",
+            self._initial_payment_payload("D-INIT-PARTIAL", amount),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        payment = Payment.objects.get(driver_id=response.data["id"])
+        self.assertEqual(payment.amount, amount)
+        self.assertEqual(
+            payment.allocations.get().target_period_start, date(2026, 11, 9)
+        )
+        coverage_response = self.client.get(
+            f"/api/drivers/{response.data['id']}/period-coverage/"
+            "?as_of=2026-11-15"
+        )
+        period = next(
+            item
+            for item in coverage_response.data["periods"]
+            if item["start"] == "2026-11-09"
+        )
+        self.assertEqual(period["paid"], f"{amount:.2f}")
+        self.assertEqual(period["remaining"], "1.00")
+        self.assertEqual(period["status"], "partial")
+
+    def test_initial_payment_requires_start_but_not_end(self):
+        payload = self._initial_payment_payload(
+            "D-INIT-NO-START", fee_for_period(date(2026, 11, 9))
+        )
+        payload.pop("initial_payment_period_start")
+
+        response = self.client.post("/api/drivers/", payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data["initial_payment_period_start"][0],
+            "شروع دوره پرداخت اولیه الزامی است.",
+        )
+        self.assertNotIn("initial_payment_period_end", response.data)
+        self.assertFalse(Driver.objects.filter(driver_code="D-INIT-NO-START").exists())
+
+    def test_retried_driver_creation_does_not_duplicate_initial_payment(self):
+        payload = self._initial_payment_payload(
+            "D-INIT-RETRY", fee_for_period(date(2026, 11, 9))
+        )
+        first_response = self.client.post(
+            "/api/drivers/", payload, format="json"
+        )
+        self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
+
+        retry_response = self.client.post(
+            "/api/drivers/", payload, format="json"
+        )
+        self.assertEqual(retry_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Payment.objects.filter(idempotency_key=payload[
+            "initial_payment_idempotency_key"
+        ]).count(), 1)
+
+    def test_initial_payment_failure_rolls_back_driver_and_payment(self):
+        fee = fee_for_period(date(2026, 11, 9))
+        driver_code = "D-INIT-ROLLBACK"
+        idempotency_key = f"initial-{driver_code}"
+        create_allocation = PaymentAllocation.objects.create
+
+        def fail_after_allocation_create(**kwargs):
+            allocation = create_allocation(**kwargs)
+            self.assertTrue(
+                Payment.objects.filter(idempotency_key=idempotency_key).exists()
+            )
+            self.assertTrue(Driver.objects.filter(driver_code=driver_code).exists())
+            self.assertTrue(
+                DriverFeeHistory.objects.filter(
+                    driver__driver_code=driver_code
+                ).exists()
+            )
+            self.assertTrue(
+                PaymentAllocation.objects.filter(pk=allocation.pk).exists()
+            )
+            raise services.FinancialError(
+                "شکست شبیه‌سازی‌شده در تخصیص پرداخت.",
+                "initial_payment_allocation_failed",
+            )
+
+        with patch.object(
+            PaymentAllocation.objects,
+            "create",
+            side_effect=fail_after_allocation_create,
+        ) as create_mock:
+            response = self.client.post(
+                "/api/drivers/",
+                self._initial_payment_payload(driver_code, fee),
+                format="json",
+            )
+
+        create_mock.assert_called_once()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data["code"], "initial_payment_allocation_failed"
+        )
+        self.assertFalse(Driver.objects.filter(driver_code=driver_code).exists())
+        self.assertFalse(
+            Payment.objects.filter(idempotency_key=idempotency_key).exists()
+        )
+        self.assertFalse(
+            PaymentAllocation.objects.filter(
+                payment__idempotency_key=idempotency_key
+            ).exists()
+        )
+        self.assertFalse(
+            DriverFeeHistory.objects.filter(driver__driver_code=driver_code).exists()
+        )
+
+    def test_guest_can_read_drivers_but_cannot_write_or_check_uniqueness(self):
+        driver = Driver.objects.create(**driver_payload())
+        guest = get_user_model().objects.create_user(
+            username="driver-guest", password="pass123"
+        )
+        self.client.force_authenticate(user=guest)
+
+        self.assertEqual(
+            self.client.get(f"/api/drivers/{driver.pk}/").status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(
+            self.client.get("/api/drivers/check-unique/").status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/drivers/", driver_payload(driver_code="D-GUEST"), format="json"
+            ).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertEqual(
+            self.client.patch(
+                f"/api/drivers/{driver.pk}/",
+                {"full_name": "Guest edit"},
+                format="json",
+            ).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/drivers/{driver.pk}/status/",
+                {"status": False},
+                format="json",
+            ).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        driver.refresh_from_db()
+        self.assertEqual(driver.full_name, "احمد علی")
+        self.assertTrue(driver.status)
+
     def test_non_manager_cannot_void_payment(self):
         """Non-manager authenticated user cannot void a payment."""
         non_manager = get_user_model().objects.create_user(
@@ -99,7 +370,8 @@ class DriverApiTests(APITestCase):
             driver_code='D-E2E02', full_name='رانندهٔ تست دو', father_name='پدر تستی',
             phone='0700000002', tazkira_number='T123457', plate_number='پ 12346',
             address='هلمت، افغانستان', registration_date=date(2026,11,9),
-            fee_start_date=date(2026,11,9), status=True
+            fee_start_date=date(2026,11,9), status=True,
+            period_calendar=Driver.PERIOD_CALENDAR_GREGORIAN,
         )
         payment = services.receive_payment(
             driver=driver,
@@ -127,23 +399,27 @@ class DriverApiTests(APITestCase):
             address='هلمت، افغانستان', registration_date=date(2026,11,9),
             fee_start_date=date(2026,11,9), status=True
         )
-        payment = services.receive_payment(
+        payment = Payment.objects.create(
             driver=driver,
             amount=D("800"),
             payment_date=date(2026, 2, 1),
-            user=self.user,
-            target_period=(date(2026, 11, 9), date(2027, 2, 8)),
+            effective_date=date(2026, 2, 1),
+            created_by=self.user,
         )
-        credit_alloc = payment.allocations.filter(
-            allocation_type=AllocationType.CREDIT
-        ).first()
+        credit_alloc = PaymentAllocation.objects.create(
+            payment=payment,
+            allocation_type=AllocationType.CREDIT,
+            allocated_amount=D("800"),
+            effective_date=date(2026, 2, 1),
+            allocated_by=self.user,
+        )
         response = self.client.post(
             "/api/credits/consume/",
             {
                 "source_allocation_id": credit_alloc.pk,
                 "amount": "100",
                 "target_period_start": "2026-11-09",
-                "target_period_end": "2027-02-08",
+                "target_period_end": "2027-02-06",
             },
             format="json",
         )
@@ -235,6 +511,47 @@ class DriverApiTests(APITestCase):
         self.assertEqual(driver.driver_code, "D-10001")
         self.assertEqual(str(driver.registration_date), "2026-01-01")
 
+    def test_driver_registration_requires_father_name_phone_and_tazkira(self):
+        for field in ("father_name", "phone", "tazkira_number"):
+            invalid_payloads = []
+            missing = driver_payload()
+            missing.pop(field)
+            invalid_payloads.append(missing)
+            invalid_payloads.extend(
+                driver_payload(**{field: value})
+                for value in ("", "   ", None)
+            )
+
+            for payload in invalid_payloads:
+                with self.subTest(field=field, payload=payload):
+                    response = self.client.post(
+                        "/api/drivers/", payload, format="json"
+                    )
+                    self.assertEqual(
+                        response.status_code, status.HTTP_400_BAD_REQUEST
+                    )
+                    self.assertIn(field, response.data)
+
+        self.assertEqual(Driver.objects.count(), 0)
+
+    def test_partial_update_allows_legacy_driver_with_missing_details(self):
+        driver = Driver.objects.create(
+            **driver_payload(father_name=None, phone=None, tazkira_number=None)
+        )
+
+        response = self.client.patch(
+            f"/api/drivers/{driver.pk}/",
+            {"address": "آدرس به‌روز شده"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        driver.refresh_from_db()
+        self.assertEqual(driver.address, "آدرس به‌روز شده")
+        self.assertIsNone(driver.father_name)
+        self.assertIsNone(driver.phone)
+        self.assertIsNone(driver.tazkira_number)
+
     def test_driver_code_is_required_and_never_generated(self):
         payload = driver_payload()
         payload.pop("driver_code")
@@ -315,6 +632,183 @@ class DriverApiTests(APITestCase):
         response = self.client.delete(f"/api/drivers/{driver.pk}/")
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
         self.assertTrue(Driver.objects.filter(pk=driver.pk).exists())
+
+    def test_archiving_removes_driver_from_active_list_search_and_unique_check(self):
+        driver = Driver.objects.create(**driver_payload())
+
+        response = self.client.post(f"/api/drivers/{driver.pk}/archive/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        driver.refresh_from_db()
+        self.assertTrue(driver.is_deleted)
+        self.assertIsNotNone(driver.deleted_at)
+        self.assertEqual(self.client.get("/api/drivers/").data["count"], 0)
+        self.assertEqual(
+            self.client.get("/api/drivers/?search=D-10001").data["count"], 0
+        )
+        self.assertEqual(
+            self.client.get(
+                "/api/drivers/check-unique/?driver_code=D-10001&plate_number=KBL%2012345"
+            ).data["driver_code_taken"],
+            False,
+        )
+        self.assertTrue(
+            self.client.get(
+                "/api/drivers/check-unique/?driver_code=D-10001&plate_number=KBL%2012345"
+            ).data["plate_number_taken"]
+        )
+        archived = self.client.get("/api/drivers/archived/")
+        self.assertEqual(archived.status_code, status.HTTP_200_OK)
+        self.assertEqual([item["id"] for item in archived.data["results"]], [driver.pk])
+        self.assertEqual(
+            self.client.get(f"/api/drivers/{driver.pk}/").status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_archived_driver_code_can_be_reused_without_moving_history_or_files(self):
+        driver = Driver.objects.create(**driver_payload())
+        driver.photo.save("old.png", make_image(), save=True)
+        photo_path = Path(self._media_dir) / driver.photo.name
+        payment = Payment.objects.create(
+            driver=driver,
+            amount=D("600"),
+            payment_date=date(2026, 11, 10),
+            effective_date=date(2026, 11, 10),
+            created_by=self.user,
+        )
+        allocation = PaymentAllocation.objects.create(
+            payment=payment,
+            allocation_type=AllocationType.FEE_PERIOD,
+            target_period_start=date(2026, 11, 9),
+            target_period_end=date(2027, 2, 8),
+            allocated_amount=D("600"),
+            effective_date=date(2026, 11, 10),
+            allocated_by=self.user,
+        )
+        refund = PaymentRefund.objects.create(
+            payment=payment,
+            amount=D("100"),
+            refund_date=date(2026, 11, 11),
+            effective_date=date(2026, 11, 11),
+            reason="آزمایش آرشیو",
+            refunded_by=self.user,
+        )
+        document = Document.objects.create(
+            driver=driver,
+            document_name="تذکره",
+            file=SimpleUploadedFile(
+                "identity.pdf",
+                b"%PDF-1.4\n%%EOF",
+                content_type="application/pdf",
+            ),
+        )
+        document_path = Path(self._media_dir) / document.file.name
+        old_history = DriverFeeHistory.objects.create(
+            driver=driver,
+            old_fee_start_date=None,
+            requested_fee_start_date=driver.fee_start_date,
+            effective_fee_start_date=driver.fee_start_date,
+            reason="سابقهٔ پیش از آرشیف",
+            changed_by=self.user,
+        )
+        history_count = DriverFeeHistory.objects.filter(driver=driver).count()
+
+        archive_response = self.client.post(f"/api/drivers/{driver.pk}/archive/")
+        self.assertEqual(
+            archive_response.status_code, status.HTTP_200_OK, archive_response.data
+        )
+        create_response = self.client.post(
+            "/api/drivers/",
+            driver_payload(driver_code=driver.driver_code, plate_number="NEW 12345"),
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        replacement = Driver.objects.get(pk=create_response.data["id"])
+
+        self.assertNotEqual(replacement.pk, driver.pk)
+        self.assertEqual(driver.payments.count(), 1)
+        self.assertEqual(payment.allocations.count(), 1)
+        self.assertEqual(payment.refunds.count(), 1)
+        self.assertEqual(payment.allocations.get().pk, allocation.pk)
+        self.assertEqual(payment.refunds.get().pk, refund.pk)
+        self.assertEqual(driver.documents.count(), 1)
+        self.assertEqual(driver.fee_history.count(), history_count)
+        self.assertFalse(replacement.payments.exists())
+        self.assertFalse(replacement.documents.exists())
+        self.assertEqual(replacement.fee_history.count(), 1)
+        self.assertEqual(driver.fee_history.get().pk, old_history.pk)
+        self.assertNotEqual(replacement.fee_history.get().pk, old_history.pk)
+        self.assertTrue(photo_path.exists())
+        self.assertTrue(document_path.exists())
+
+    def test_restore_succeeds_when_serial_is_available(self):
+        driver = Driver.objects.create(**driver_payload())
+        self.client.post(f"/api/drivers/{driver.pk}/archive/")
+
+        response = self.client.post(f"/api/drivers/{driver.pk}/restore/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        driver.refresh_from_db()
+        self.assertFalse(driver.is_deleted)
+        self.assertIsNone(driver.deleted_at)
+        self.assertEqual(
+            self.client.get("/api/drivers/?search=D-10001").data["count"], 1
+        )
+
+    def test_admin_can_archive_and_restore_driver(self):
+        admin = get_user_model().objects.create_user(
+            username="archive-admin",
+            password="pass123",
+            is_staff=True,
+        )
+        self.client.force_authenticate(user=admin)
+        driver = Driver.objects.create(**driver_payload())
+
+        archive_response = self.client.post(f"/api/drivers/{driver.pk}/archive/")
+        restore_response = self.client.post(f"/api/drivers/{driver.pk}/restore/")
+
+        self.assertEqual(archive_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(restore_response.status_code, status.HTTP_200_OK)
+
+    def test_restore_fails_clearly_if_serial_was_reused(self):
+        archived = Driver.objects.create(**driver_payload())
+        self.client.post(f"/api/drivers/{archived.pk}/archive/")
+        replacement = self.client.post(
+            "/api/drivers/",
+            driver_payload(driver_code=archived.driver_code, plate_number="NEW 54321"),
+            format="json",
+        )
+        self.assertEqual(replacement.status_code, status.HTTP_201_CREATED)
+
+        response = self.client.post(f"/api/drivers/{archived.pk}/restore/")
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("شماره مسلسل", response.data["detail"])
+        archived.refresh_from_db()
+        self.assertTrue(archived.is_deleted)
+
+    def test_guest_cannot_list_archive_archive_or_restore_drivers(self):
+        driver = Driver.objects.create(**driver_payload())
+        guest = get_user_model().objects.create_user(
+            username="archive-guest", password="pass123"
+        )
+        self.client.force_authenticate(user=guest)
+
+        self.assertEqual(
+            self.client.get("/api/drivers/archived/").status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertEqual(
+            self.client.post(f"/api/drivers/{driver.pk}/archive/").status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        driver.is_deleted = True
+        driver.deleted_at = timezone.now()
+        driver.save(update_fields=["is_deleted", "deleted_at", "updated_at"])
+        self.assertEqual(
+            self.client.post(f"/api/drivers/{driver.pk}/restore/").status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
 
     def test_activate_and_deactivate(self):
         driver = Driver.objects.create(**driver_payload())
@@ -432,10 +926,10 @@ class DriverApiTests(APITestCase):
         )
         payment_data = {
             "driver_id": driver.id,
-            "amount": "600",
+            "amount": "300",
             "payment_date": "2026-11-09",
             "target_period_start": "2026-11-09",
-            "target_period_end": "2027-02-08",
+            "target_period_end": "2027-02-06",
             "idempotency_key": "unique-payment-key-1",
         }
 
@@ -463,10 +957,10 @@ class DriverApiTests(APITestCase):
 
         payment_data = {
             "driver_id": driver.id,
-            "amount": "600",
+            "amount": "300",
             "payment_date": "2026-11-09",
             "target_period_start": "2026-11-09",
-            "target_period_end": "2027-02-08",
+            "target_period_end": "2027-02-06",
         }
 
         # First payment with key 1

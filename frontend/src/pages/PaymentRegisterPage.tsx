@@ -1,72 +1,249 @@
-import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Link, useSearchParams, useParams } from 'react-router-dom'
 import { ArrowRightIcon, CreditCardIcon, RefreshIcon } from '../components/icons'
+import { DualDateInput } from '../components/DualDateInput'
 import { Button } from '../components/ui/Button'
 import { Field } from '../components/ui/Field'
 import { PageHeader } from '../components/ui/PageHeader'
 import { useToast } from '../context/ToastContext'
 import {
   fetchDriver,
+  fetchDrivers,
   receivePayment,
-  fetchDriverPeriods,
+  fetchDriverPeriodCoverage,
 } from '../lib/api'
-import { formatJalaliShort, toPersianDigits } from '../lib/dates'
-import { getErrorMessage, isAbortError } from '../lib/errors'
-import type { ReceivePaymentInput } from '../types/financial'
+import {
+  formatJalaliShort,
+  isValidIsoDate,
+  todayIsoKabul,
+  toPersianDigits,
+} from '../lib/dates'
+import { getErrorMessage, isAbortError, normalizeDigits } from '../lib/errors'
+import type { Driver, DriverListParams } from '../types/driver'
+import type {
+  DriverPeriodCoverage,
+  PeriodCoverageRow,
+  ReceivePaymentInput,
+} from '../types/financial'
+
+function formatAmount(value: number): string {
+  return toPersianDigits(
+    new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(value),
+  )
+}
+
+type PeriodFilter = 'all' | 'with-debt' | 'settled'
+
+const PERIOD_FILTER_LABELS: Record<PeriodFilter, string> = {
+  all: 'همه دوره‌ها',
+  'with-debt': 'دارای بدهی',
+  settled: 'تسویه‌شده',
+}
+
+function periodStatusLabel(status: PeriodCoverageRow['status']): string {
+  switch (status) {
+    case 'paid':
+      return 'تسویه‌شده'
+    case 'partial':
+      return 'پرداخت جزئی'
+    case 'unpaid':
+      return 'پرداخت‌نشده'
+    default:
+      return status
+  }
+}
+
+function periodStatusBadge(status: PeriodCoverageRow['status']): string {
+  switch (status) {
+    case 'paid':
+      return 'bg-emerald-100 text-emerald-700 border-emerald-200'
+    case 'partial':
+      return 'bg-amber-100 text-amber-700 border-amber-200'
+    case 'unpaid':
+      return 'bg-rose-100 text-rose-700 border-rose-200'
+    default:
+      return 'bg-slate-100 text-slate-600 border-slate-200'
+  }
+}
 
 export function PaymentRegisterPage() {
   const [searchParams] = useSearchParams()
-  const navigate = useNavigate()
   const { id } = useParams()
   const prefillDriverId = searchParams.get('driver_id') || id
-  const [driver, setDriver] = useState<any>(null)
-  const [periods, setPeriods] = useState<any>(null)
+
+  const [driver, setDriver] = useState<Driver | null>(null)
+  const [drivers, setDrivers] = useState<Driver[]>([])
+  const [coverage, setCoverage] = useState<DriverPeriodCoverage | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
-  const [allocationMethod, setAllocationMethod] = useState<'period' | 'credit'>('period')
+  const [fieldErrors, setFieldErrors] = useState<{
+    amount?: string
+    paymentDate?: string
+    targetPeriod?: string
+  }>({})
+  const [periodFilter, setPeriodFilter] = useState<PeriodFilter>('all')
+  const [selectedPeriodKey, setSelectedPeriodKey] = useState<string | null>(null)
+  const abortControllerRef = useRef<AbortController | null>(null)
+
   const [form, setForm] = useState<ReceivePaymentInput>({
     driver_id: prefillDriverId ? Number(prefillDriverId) : 0,
     amount: '',
-    payment_date: new Date().toISOString().split('T')[0],
+    payment_date: todayIsoKabul(),
     target_period_start: '',
     target_period_end: '',
-    periods_count: 1,
-    receipt_number: '',
-    idempotency_key: '',
   })
   const { notify } = useToast()
 
-  useEffect(() => {
-    if (!prefillDriverId) {
-      setLoading(false)
-      return
+  const loadDriverData = useCallback((driverId: number) => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
     }
-    let active = true
     const controller = new AbortController()
+    abortControllerRef.current = controller
+
     setLoading(true)
     setError(null)
     Promise.all([
-      fetchDriver(Number(prefillDriverId), controller.signal),
-      fetchDriverPeriods(Number(prefillDriverId), controller.signal, 4),
+      fetchDriver(driverId, controller.signal),
+      fetchDriverPeriodCoverage(driverId, undefined, controller.signal),
     ])
-      .then(([drv, per]) => {
-        if (active) {
+      .then(([drv, cov]) => {
+        if (!controller.signal.aborted) {
           setDriver(drv)
-          setPeriods(per)
+          setCoverage(cov)
+          setForm((prev) => ({ ...prev, driver_id: drv.id }))
+          // Reset selection when driver data reloads
+          setSelectedPeriodKey(null)
+          setForm((prev) => ({
+            ...prev,
+            target_period_start: '',
+            target_period_end: '',
+          }))
         }
       })
       .catch((cause) => {
-        if (active && !isAbortError(cause)) setError(getErrorMessage(cause))
+        if (!controller.signal.aborted && !isAbortError(cause)) {
+          setError(getErrorMessage(cause))
+        }
       })
       .finally(() => {
-        if (active) setLoading(false)
+        if (!controller.signal.aborted) setLoading(false)
       })
+
     return () => {
-      active = false
       controller.abort()
     }
-  }, [prefillDriverId])
+  }, [])
+
+  useEffect(() => {
+    // Load all drivers for the dropdown
+    const params: DriverListParams = {
+      status: 'active',
+      page_size: 100,
+    }
+    fetchDrivers(params)
+      .then((response) => {
+        setDrivers(response.results)
+      })
+      .catch((cause) => {
+        console.error('Failed to load drivers:', cause)
+      })
+
+    // Load prefilled driver data if provided
+    if (prefillDriverId) {
+      loadDriverData(Number(prefillDriverId))
+    } else {
+      setLoading(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const periodsList = useMemo(
+    () => coverage?.periods || [],
+    [coverage],
+  )
+
+  const filteredPeriods = useMemo(() => {
+    return periodsList.filter((p) => {
+      if (periodFilter === 'settled') return p.status === 'paid'
+      if (periodFilter === 'with-debt') return p.status === 'partial' || p.status === 'unpaid'
+      return true
+    })
+  }, [periodsList, periodFilter])
+
+  const selectedPeriod = useMemo(
+    () =>
+      selectedPeriodKey
+        ? periodsList.find((p) => `${p.start},${p.end}` === selectedPeriodKey) || null
+        : null,
+    [periodsList, selectedPeriodKey],
+  )
+
+  const amount = normalizeDigits(form.amount).trim()
+  const amountNum = /^\d+$/.test(amount) ? Number(amount) : 0
+
+  // Compute Own-First allocation preview starting from selected period
+  const allocationPreview = useMemo(() => {
+    if (!selectedPeriod || amountNum <= 0) return []
+
+    const preview: Array<{ period: PeriodCoverageRow; allocated: number }> = []
+    let remainder = amountNum
+    const startIndex = periodsList.findIndex(
+      (p) => p.start === selectedPeriod.start && p.end === selectedPeriod.end,
+    )
+    if (startIndex < 0) return []
+
+    for (let i = startIndex; i < periodsList.length && remainder > 0; i += 1) {
+      const p = periodsList[i]
+      // Skip already fully paid periods — they have no remaining debt
+      const remaining = Number(p.remaining)
+      if (remaining <= 0) continue
+      const allocated = Math.min(remaining, remainder)
+      if (allocated > 0) {
+        preview.push({ period: p, allocated })
+        remainder -= allocated
+      }
+    }
+    return preview
+  }, [selectedPeriod, amountNum, periodsList])
+
+  const totalAllocated = useMemo(
+    () =>
+      allocationPreview.reduce((sum, item) => sum + item.allocated, 0),
+    [allocationPreview],
+  )
+
+  const previewRemainder = amountNum - totalAllocated
+
+  const handleSelectDriver = (id: number) => {
+    if (!id) {
+      setDriver(null)
+      setCoverage(null)
+      setSelectedPeriodKey(null)
+      setForm((prev) => ({
+        ...prev,
+        driver_id: 0,
+        amount: '',
+        target_period_start: '',
+        target_period_end: '',
+      }))
+      return
+    }
+    loadDriverData(id)
+  }
+
+  const handleSelectPeriod = (period: PeriodCoverageRow) => {
+    // Prevent selecting fully paid periods
+    if (period.status === 'paid') return
+    setSelectedPeriodKey(`${period.start},${period.end}`)
+    setForm((prev) => ({
+      ...prev,
+      target_period_start: period.start,
+      target_period_end: period.end,
+    }))
+    setFieldErrors((current) => ({ ...current, targetPeriod: undefined }))
+  }
 
   const handleChange = (key: keyof ReceivePaymentInput, value: string | number) => {
     setForm((prev) => ({ ...prev, [key]: value }))
@@ -74,33 +251,68 @@ export function PaymentRegisterPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    setSubmitting(true)
+    if (submitting) return
     setError(null)
+    const nextFieldErrors: typeof fieldErrors = {}
+
+    if (!/^\d+$/.test(amount) || amountNum <= 0) {
+      nextFieldErrors.amount = 'مبلغ باید یک عدد صحیح بزرگ‌تر از صفر باشد.'
+    }
+    if (!isValidIsoDate(form.payment_date)) {
+      nextFieldErrors.paymentDate = 'تاریخ پرداخت را از تقویم انتخاب کنید.'
+    } else if (form.payment_date > todayIsoKabul()) {
+      nextFieldErrors.paymentDate = 'تاریخ پرداخت نمی‌تواند در آینده باشد.'
+    }
+    if (!driver) {
+      setError('راننده معتبر انتخاب نشده است.')
+    }
+    if (!selectedPeriod) {
+      nextFieldErrors.targetPeriod = 'یک دوره مالی قابل پرداخت انتخاب کنید.'
+    }
+
+    // Frontend validation: amount must not exceed total remaining debt of selectable periods
+    const selectableRemaining = periodsList
+      .filter((p) => p.status !== 'paid')
+      .reduce((sum, p) => sum + Number(p.remaining), 0)
+    if (
+      selectedPeriod &&
+      /^\d+$/.test(amount) &&
+      amountNum > selectableRemaining &&
+      selectableRemaining > 0
+    ) {
+      nextFieldErrors.amount =
+        'مبلغ پرداختی بیشتر از کل بدهی معتبر دوره‌های قابل پرداخت است.'
+    }
+
+    setFieldErrors(nextFieldErrors)
+    if (Object.keys(nextFieldErrors).length > 0 || !driver || !selectedPeriod) {
+      notify('error', 'اطلاعات پرداخت را بررسی کنید.')
+      return
+    }
+
+    setSubmitting(true)
     try {
-      if (
-        allocationMethod === 'period' &&
-        (!form.target_period_start || !form.target_period_end)
-      ) {
-        const message = 'برای تخصیص به دوره‌های مشخص، یک دوره مالی را انتخاب کنید.'
-        setError(message)
-        notify('error', message)
-        return
-      }
       const payload: ReceivePaymentInput = {
-        driver_id: form.driver_id,
-        amount: form.amount,
+        driver_id: driver.id,
+        amount,
         payment_date: form.payment_date,
-        target_period_start:
-          allocationMethod === 'period' ? form.target_period_start || undefined : undefined,
-        target_period_end:
-          allocationMethod === 'period' ? form.target_period_end || undefined : undefined,
-        periods_count: allocationMethod === 'period' ? Number(form.periods_count) || 1 : 1,
-        receipt_number: form.receipt_number,
-        idempotency_key: form.idempotency_key || undefined,
+        target_period_start: form.target_period_start,
+        target_period_end: form.target_period_end,
       }
       const result = await receivePayment(payload)
       notify('success', `پرداخت ${toPersianDigits(result.amount)} AFN با موفقیت ثبت شد.`)
-      navigate(`/drivers/${result.driver}`)
+
+      // Refresh driver data after successful payment to update period statuses
+      if (driver.id) {
+        loadDriverData(driver.id)
+      }
+      setForm((prev) => ({
+        ...prev,
+        amount: '',
+        target_period_start: '',
+        target_period_end: '',
+      }))
+      setSelectedPeriodKey(null)
     } catch (cause) {
       if (!isAbortError(cause)) {
         const msg = getErrorMessage(cause)
@@ -133,13 +345,6 @@ export function PaymentRegisterPage() {
     )
   }
 
-  const periodOptions = (periods?.periods || []).map((p: any) => ({
-    label: `${formatJalaliShort(p.start)} تا ${formatJalaliShort(p.end)}${
-      p.fee ? ` — ${toPersianDigits(p.fee)} AFN` : ''
-    }`,
-    value: `${p.start},${p.end}`,
-  }))
-
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between gap-3">
@@ -155,7 +360,7 @@ export function PaymentRegisterPage() {
             to={`/financial/drivers/${driver.id}`}
             className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-600 transition hover:text-slate-900"
           >
-            مشاهده پروفایل مالی ranنده
+            مشاهده پروفایل مالی راننده
           </Link>
         )}
       </div>
@@ -163,7 +368,7 @@ export function PaymentRegisterPage() {
       <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
         <PageHeader
           title="ثبت پرداخت جدید"
-          description="ثبت حق‌الزحمه و تعیین روش تخصیص آن."
+          description="مبلغ پرداخت از دورهٔ انتخاب‌شده آغاز می‌شود و مانده به‌ترتیب به دوره‌های بعدی می‌رسد."
         />
 
         <form onSubmit={handleSubmit} className="p-5 space-y-5">
@@ -173,215 +378,296 @@ export function PaymentRegisterPage() {
               required
               error={!driver ? 'راننده معتبر انتخاب نشده است.' : undefined}
             >
-              <select
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={form.driver_id || ''}
-                onChange={(e) => handleChange('driver_id', e.target.value)}
-              >
-                <option value="">انتخاب Ranنده</option>
-                {driver && (
-                  <option value={driver.id} selected>
-                    {driver.full_name} ({driver.driver_code})
-                  </option>
-                )}
-              </select>
+              {prefillDriverId && driver ? (
+                <input
+                  readOnly
+                  value={`${driver.full_name} (${driver.driver_code})`}
+                  className="block w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-700 shadow-xs"
+                />
+              ) : (
+                <select
+                  className="block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 shadow-xs outline-none transition hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
+                  value={form.driver_id || ''}
+                  onChange={(event) => {
+                    handleSelectDriver(Number(event.target.value))
+                  }}
+                >
+                  <option value="">انتخاب راننده</option>
+                  {drivers.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.full_name} ({d.driver_code})
+                    </option>
+                  ))}
+                </select>
+              )}
             </Field>
 
             <Field label="مبلغ (افغانی)" required>
               <input
                 type="text"
                 inputMode="numeric"
-                pattern="[0-9]*"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 font-mono dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={form.amount}
-                onChange={(e) => handleChange('amount', e.target.value)}
+                pattern="[0-9۰-۹٠-٩]*"
+                className="block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 font-mono dir-ltr shadow-xs outline-none transition hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
+                value={form.amount}
+                onChange={(event) => {
+                  handleChange('amount', event.target.value)
+                  setFieldErrors((current) => ({ ...current, amount: undefined }))
+                }}
                 placeholder="مثلاً 600"
+                aria-invalid={Boolean(fieldErrors.amount)}
               />
+              {fieldErrors.amount && (
+                <p className="mt-1 text-xs text-rose-600">{fieldErrors.amount}</p>
+              )}
             </Field>
 
-            <Field label="تاریخ پرداخت (شمسی)" required>
-              <input
-                type="text"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={form.payment_date}
-                onChange={(e) => handleChange('payment_date', e.target.value)}
-                placeholder="۱۴۰۵/۰۸/۲۰"
-              />
-            </Field>
+            <DualDateInput
+              id="payment_date"
+              label="تاریخ پرداخت"
+              value={form.payment_date}
+              onChange={(value) => {
+                handleChange('payment_date', value)
+                setFieldErrors((current) => ({ ...current, paymentDate: undefined }))
+              }}
+              required
+              error={fieldErrors.paymentDate}
+              hint="تاریخ را از تقویم شمسی انتخاب کنید."
+            />
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            <Field label="شماره رسید (اختیاری)">
-              <input
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={form.receipt_number}
-                onChange={(e) => handleChange('receipt_number', e.target.value)}
-                placeholder="شماره رسید"
-              />
-            </Field>
+          {/* Period filter */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-medium text-slate-600">فیلتر دوره‌ها:</span>
+            {(Object.keys(PERIOD_FILTER_LABELS) as PeriodFilter[]).map((filter) => (
+              <button
+                key={filter}
+                type="button"
+                onClick={() => setPeriodFilter(filter)}
+                className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition ${
+                  periodFilter === filter
+                    ? 'border-brand-500 bg-brand-50 text-brand-700'
+                    : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                }`}
+              >
+                {PERIOD_FILTER_LABELS[filter]}
+              </button>
+            ))}
+          </div>
 
-            <Field label="کلید تکرارپذیری (اختیاری)">
-              <input
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                defaultValue={form.idempotency_key}
-                onChange={(e) => handleChange('idempotency_key', e.target.value)}
-                placeholder="شناسه یکتا درخواست"
-              />
-            </Field>
+          {/* Smart period list */}
+          <div
+            className="grid gap-2"
+            style={{
+              gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
+            }}
+          >
+            {filteredPeriods.length === 0 ? (
+              <div className="col-span-full p-4 rounded-xl border border-slate-200 bg-slate-50 text-center text-sm text-slate-500">
+                دوره‌ای با این فیلتر یافت نشد.
+              </div>
+            ) : (
+              filteredPeriods.map((period) => {
+                const isSelected = selectedPeriodKey === `${period.start},${period.end}`
+                const isPaid = period.status === 'paid'
+                const isOverdue = period.is_overdue && Number(period.remaining) > 0
+                const remainingNum = Number(period.remaining)
+                const paidNum = Number(period.paid)
+                const totalNum = Number(period.total)
 
+                return (
+                  <button
+                    key={period.start}
+                    type="button"
+                    onClick={() => handleSelectPeriod(period)}
+                    disabled={isPaid}
+                    className={`
+                      rounded-xl border p-3 transition-all duration-200
+                      ${isSelected
+                        ? 'border-brand-500 bg-brand-50 shadow-sm ring-1 ring-brand-500'
+                        : isPaid
+                        ? 'border-slate-200 bg-slate-50 text-slate-400 opacity-60'
+                        : 'border-slate-200 bg-white hover:border-slate-300 hover:shadow-sm'
+                      }
+                    `}
+                    title={
+                      period.is_future
+                        ? 'دوره آینده — هنوز شروع نشده است'
+                        : isOverdue
+                        ? 'دوره معوق — سررسید گذشته است'
+                        : ''
+                    }
+                  >
+                    <div className="flex items-start justify-between gap-2 mb-1">
+                      <span
+                        className={`text-xs font-medium leading-none ${
+                          isSelected ? 'text-brand-700' : 'text-slate-700'
+                        }`}
+                      >
+                        #{periodsList.findIndex(
+                          (p) => p.start === period.start && p.end === period.end,
+                        ) +
+                        1}
+                      </span>
+                      {isSelected && (
+                        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold border border-brand-500 text-brand-700 bg-brand-50">
+                          انتخاب‌شده
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="space-y-1">
+                      <div className="flex justify-between items-baseline">
+                        <span className="text-xs text-slate-500">شروع — پایان</span>
+                        <span className="text-xs font-mono text-slate-700 dir-ltr">
+                          {formatJalaliShort(period.start)} — {formatJalaliShort(
+                            period.end,
+                          )}
+                        </span>
+                      </div>
+
+                      <div className="flex justify-between items-baseline">
+                        <span className="text-xs text-slate-500">مبلغ کل دوره</span>
+                        <span className="text-xs font-mono text-slate-700 dir-ltr">
+                          {toPersianDigits(totalNum.toFixed(0))} AFN
+                        </span>
+                      </div>
+
+                      <div className="flex justify-between items-baseline">
+                        <span className="text-xs text-slate-500">پرداخت‌شده</span>
+                        <span className="text-xs font-mono text-emerald-600 dir-ltr">
+                          {toPersianDigits(paidNum.toFixed(0))} AFN
+                        </span>
+                      </div>
+
+                      <div className="flex justify-between items-baseline">
+                        <span className="text-xs text-slate-500">باقی‌مانده</span>
+                        <span
+                          className={`text-xs font-bold font-mono dir-ltr ${
+                            remainingNum === 0
+                              ? 'text-emerald-600'
+                              : isOverdue
+                              ? 'text-rose-600'
+                              : 'text-slate-700'
+                          }`}
+                        >
+                          {toPersianDigits(remainingNum.toFixed(0))} AFN
+                        </span>
+                      </div>
+
+                      <span
+                        className={`inline-flex items-center justify-center rounded-full px-2 py-0.5 text-[10px] font-bold border ${
+                          periodStatusBadge(period.status)
+                        }`}
+                      >
+                        {periodStatusLabel(period.status)}
+                        {period.is_overdue && remainingNum > 0 && ' • معوق'}
+                      </span>
+
+                      {period.is_future && (
+                        <span className="text-[10px] text-slate-400 italic mt-0.5">
+                          هنوز شروع نشده است
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                )
+              })
+            )}
           </div>
 
           <fieldset className="rounded-xl border border-slate-200 bg-slate-50 p-4">
             <legend className="px-1 text-sm font-semibold text-slate-800">روش تخصیص پرداخت</legend>
             <div className="grid gap-3 sm:grid-cols-2">
               <label
-                className={`flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition ${
-                  allocationMethod === 'period'
-                    ? 'border-blue-500 bg-blue-50'
-                    : 'border-slate-200 bg-white hover:border-slate-300'
-                }`}
+                className="flex cursor-pointer items-start gap-3 rounded-xl border border-brand-500 bg-brand-50 p-3 shadow-xs transition"
               >
                 <input
                   type="radio"
                   name="allocation-method"
                   value="period"
-                  checked={allocationMethod === 'period'}
-                  onChange={() => setAllocationMethod('period')}
+                  checked
+                  readOnly
                   className="mt-0.5"
                 />
                 <span>
-                  <span className="block text-sm font-medium text-slate-800">تخصیص به دوره‌های مشخص</span>
-                  <span className="mt-1 block text-xs text-slate-500">
-                    پرداخت را برای یک یا چند دورهٔ متوالی انتخاب کنید.
+                  <span className="block text-sm font-medium text-slate-800">
+                    تخصیص خودکار به دوره‌ها
                   </span>
-                </span>
-              </label>
-              <label
-                className={`flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition ${
-                  allocationMethod === 'credit'
-                    ? 'border-blue-500 bg-blue-50'
-                    : 'border-slate-200 bg-white hover:border-slate-300'
-                }`}
-              >
-                <input
-                  type="radio"
-                  name="allocation-method"
-                  value="credit"
-                  checked={allocationMethod === 'credit'}
-                  onChange={() => setAllocationMethod('credit')}
-                  className="mt-0.5"
-                />
-                <span>
-                  <span className="block text-sm font-medium text-slate-800">ثبت به‌عنوان اعتبار</span>
                   <span className="mt-1 block text-xs text-slate-500">
-                    پرداخت بدون اتصال مستقیم به یک دوره ثبت می‌شود.
+                    مبلغ از دورهٔ انتخاب‌شده آغاز می‌شود و مابقی به‌ترتیب میان دوره‌های بعدی تقسیم می‌شود.
                   </span>
                 </span>
               </label>
             </div>
           </fieldset>
 
-          {allocationMethod === 'period' && (
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field label="دوره هدف" required>
-                <select
-                  className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                  value={
-                    form.target_period_start && form.target_period_end
-                      ? `${form.target_period_start},${form.target_period_end}`
-                      : ''
-                  }
-                  onChange={(e) => {
-                    const val = e.target.value
-                    if (!val) {
-                      handleChange('target_period_start', '')
-                      handleChange('target_period_end', '')
-                      return
-                    }
-                    const [start, end] = val.split(',')
-                    handleChange('target_period_start', start)
-                    handleChange('target_period_end', end)
-                  }}
-                >
-                  <option value="">انتخاب دوره مالی</option>
-                  {periodOptions.map((opt: { label: string; value: string }) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-
-              <Field label="تعداد دوره‌های پوشش‌داده‌شده">
-                <select
-                  className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                  value={String(form.periods_count ?? 1)}
-                  onChange={(e) => handleChange('periods_count', Number(e.target.value))}
-                >
-                  {[1, 2, 3, 4].map((count) => (
-                    <option key={count} value={count}>
-                      {toPersianDigits(count.toString())} دوره
-                    </option>
-                  ))}
-                </select>
-              </Field>
-            </div>
+          {/* Allocation preview */}
+          {allocationPreview.length > 0 && (
+            <section
+              aria-live="polite"
+              className="rounded-xl border border-brand-100 bg-brand-50/60 p-4"
+            >
+              <h3 className="text-sm font-semibold text-slate-800">
+                پیش‌نمایش تخصیص خودکار
+              </h3>
+              <p className="mt-1 text-xs text-slate-600">
+                مبلغ از دورهٔ انتخاب‌شده آغاز می‌شود و ماندهٔ آن به‌ترتیب به دوره‌های بعدی می‌رسد.
+              </p>
+              <ul className="mt-3 divide-y divide-brand-100">
+                {allocationPreview.map(({ period, allocated }) => (
+                  <li
+                    key={period.start}
+                    className="flex items-center justify-between gap-3 py-2 text-sm"
+                  >
+                    <span className="text-slate-700">
+                      {formatJalaliShort(period.start)} تا {formatJalaliShort(
+                        period.end,
+                      )}
+                    </span>
+                    <span className="font-mono font-semibold text-slate-800" dir="ltr">
+                      {formatAmount(allocated)} AFN
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-brand-100 pt-3 text-sm">
+                <span className="font-medium text-slate-700">مجموع تخصیص‌شده</span>
+                <span className="font-mono font-semibold text-slate-900" dir="ltr">
+                  {formatAmount(totalAllocated)} AFN
+                </span>
+              </div>
+              {previewRemainder > 0 && (
+                <p className="mt-2 text-xs text-amber-700">
+                  بقیه مانده در دوره‌های بعدی هنگام ثبت به‌صورت خودکار ادامه می‌یابد.
+                </p>
+              )}
+            </section>
           )}
 
           <div className="flex items-center gap-3 pt-2">
-            <Button type="submit" loading={submitting} icon={<CreditCardIcon className="size-4" />}>
+            <Button
+              type="submit"
+              loading={submitting}
+              disabled={!driver || !selectedPeriod || amountNum <= 0}
+              icon={<CreditCardIcon className="size-4" />}
+            >
               ثبت پرداخت
             </Button>
             <Button
               variant="secondary"
               size="sm"
               onClick={() => {
-                setForm((prev) => ({ ...prev, amount: '', receipt_number: '', idempotency_key: '' }))
+                setForm((prev) => ({
+                  ...prev,
+                  amount: '',
+                }))
               }}
             >
-              پاک کردن فرم
+              پاک کردن مبلغ
             </Button>
           </div>
         </form>
       </section>
-
-      {driver && (
-        <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-          <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
-            <h2 className="text-sm font-semibold text-slate-800">دوره‌های مالی</h2>
-            <div className="overflow-x-auto p-3">
-              <table className="w-full min-w-[640px] text-sm">
-                <thead className="bg-slate-50 text-xs text-slate-500">
-                  <tr>
-                    <th className="px-4 py-2 text-right font-medium">دوره</th>
-                    <th className="px-4 py-2 text-right font-middle" dir="ltr">شروع</th>
-                    <th className="px-4 py-2 text-right font-middle" dir="ltr">پایان</th>
-                    <th className="px-4 py-2 text-right font-middle" dir="ltr">مبلغ دوره</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {(periods?.periods || []).map((p: any, idx: number) => (
-                    <tr key={idx} className="transition hover:bg-slate-50/70">
-                      <td className="px-4 py-2 text-sm font-mono text-slate-600" dir="ltr">
-                        #{idx + 1}
-                      </td>
-                      <td className="px-4 py-2 text-xs text-slate-500">
-                        {formatJalaliShort(p.start)}
-                      </td>
-                      <td className="px-4 py-2 text-xs text-slate-500">
-                        {formatJalaliShort(p.end)}
-                      </td>
-                      <td className="px-4 py-2 font-mono text-xs text-slate-600" dir="ltr">
-                        {p.fee != null ? `${toPersianDigits(p.fee)} AFN` : '—'}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </section>
-      )}
     </div>
   )
 }

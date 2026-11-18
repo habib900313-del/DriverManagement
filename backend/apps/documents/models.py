@@ -1,9 +1,18 @@
 import os
 import uuid
 
+from PIL import Image, UnidentifiedImageError
 from django.conf import settings
 from django.db import models
 from django.core.exceptions import ValidationError
+
+MAX_DOCUMENT_SIZE = 10 * 1024 * 1024
+ALLOWED_IMAGE_FORMATS = {
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".png": "PNG",
+    ".webp": "WEBP",
+}
 
 
 def document_upload_path(instance, filename):
@@ -17,38 +26,45 @@ def document_upload_path(instance, filename):
 
 
 def validate_pdf_file(value):
-    # Check extension
     ext = os.path.splitext(value.name)[1].lower()
-    if ext != '.pdf':
-        raise ValidationError(
-            "فایل باید پسوند .pdf داشته باشد."
-        )
-    
-    # Check file size (max 10MB)
-    max_size = 10 * 1024 * 1024  # 10MB
-    if value.size > max_size:
+    if value.size > MAX_DOCUMENT_SIZE:
         raise ValidationError(
             f"حجم فایل نباید بیش از ۱۰ مگابایت باشد. (حجم فعلی: {value.size / 1024 / 1024:.2f} MB)"
         )
-    
-    # Check PDF magic bytes (%PDF-)
-    try:
-        value.open('rb')
-        header = value.read(5)
-        value.seek(0)
-        if not header.startswith(b'%PDF'):
-            raise ValidationError(
-                "فایل انتخابی یک فایل PDF معتبر نیست. (آدرس شروع فایل %PDF نمی‌باشد)"
-            )
-    except Exception:
-        raise ValidationError(
-            "خطا در بررسی محتوای فایل. لطفاً مطمئن شوید فایل PDF سالم است."
-        )
-    finally:
+
+    if ext == ".pdf":
         try:
             value.seek(0)
-        except:
-            pass
+            header = value.read(5)
+            value.seek(0)
+        except (AttributeError, OSError, ValueError):
+            raise ValidationError("خواندن فایل PDF انتخاب‌شده ممکن نشد.")
+
+        if not header.startswith(b"%PDF-"):
+            raise ValidationError("محتوای فایل با پسوند PDF مطابقت ندارد.")
+        return
+
+    expected_format = ALLOWED_IMAGE_FORMATS.get(ext)
+    if expected_format is None:
+        raise ValidationError("فقط فایل PDF یا تصویر JPG، PNG و WebP مجاز است.")
+
+    try:
+        value.seek(0)
+        image = Image.open(value)
+        image_format = (image.format or "").upper()
+        image.verify()
+        value.seek(0)
+    except (
+        AttributeError,
+        Image.DecompressionBombError,
+        OSError,
+        UnidentifiedImageError,
+        ValueError,
+    ):
+        raise ValidationError("محتوای فایل تصویر معتبر نیست.")
+
+    if image_format != expected_format:
+        raise ValidationError("پسوند فایل با نوع واقعی تصویر مطابقت ندارد.")
 
 
 class Document(models.Model):

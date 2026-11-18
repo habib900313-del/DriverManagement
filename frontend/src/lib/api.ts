@@ -1,4 +1,9 @@
-import type { CreateManagedUserInput, ManagedUser, User } from '../types/auth'
+import type {
+  CreateManagedUserInput,
+  ManagedUser,
+  UpdateManagedUserInput,
+  User,
+} from '../types/auth'
 import type {
   AllocationConsumptionListItem,
   CashRevenueReport,
@@ -10,12 +15,16 @@ import type {
   DriverFinancialSummary,
   DriverFeeHistoryListItem,
   DriverPeriodsResponse,
+  FinancialReportArchiveStatus,
   FeeScheduleInput,
   DriverPeriodCoverage,
   FeeScheduleListItem,
   FeeStartDateInput,
   FinancialReport,
   PaymentListItem,
+  PaymentListParams,
+  PaymentRefundInput,
+  PaymentRefundListItem,
   ReceivePaymentInput,
   ReverseAdjustmentInput,
   AdjustmentInput,
@@ -30,8 +39,14 @@ import type {
   PaginatedResponse,
   UniqueCheckResult,
 } from '../types/driver'
+import type {
+  ActivityLogDetail,
+  ActivityLogFilterOptions,
+  ActivityLogListItem,
+  ActivityLogListParams,
+} from '../types/activity'
 
-const API_BASE = '/api'
+const API_BASE = (import.meta.env.VITE_API_BASE as string) || '/api'
 
 export interface HealthResponse {
   status: 'ok' | 'degraded'
@@ -50,6 +65,20 @@ export async function createManagedUser(
   payload: CreateManagedUserInput,
 ): Promise<ManagedUser> {
   return request('/users/', { method: 'POST', body: payload })
+}
+
+export async function updateManagedUser(
+  userId: number,
+  payload: UpdateManagedUserInput,
+): Promise<ManagedUser> {
+  return request(`/users/${userId}/`, { method: 'PATCH', body: payload })
+}
+
+export async function resetManagedUserPassword(
+  userId: number,
+  payload: { new_password: string; password_confirmation: string },
+): Promise<{ detail: string }> {
+  return request(`/users/${userId}/password/`, { method: 'POST', body: payload })
 }
 
 export class ApiError extends Error {
@@ -144,6 +173,7 @@ interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   body?: unknown
   signal?: AbortSignal
+  cache?: RequestCache
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -170,6 +200,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     headers,
     body,
     signal: options.signal,
+    cache: options.cache,
   })
 
   let payload: unknown = null
@@ -200,7 +231,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 // Health
 // ---------------------------------------------------------------------------
 export async function fetchHealth(signal?: AbortSignal): Promise<HealthResponse> {
-  return request<HealthResponse>('/health/', { signal })
+  return request<HealthResponse>('/health/', { signal, cache: 'no-store' })
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +286,25 @@ export async function fetchDrivers(
   return request<PaginatedResponse<Driver>>(`/drivers/${query}`, { signal })
 }
 
+export async function fetchArchivedDrivers(
+  page = 1,
+  pageSize = 25,
+  signal?: AbortSignal,
+): Promise<PaginatedResponse<Driver>> {
+  const query = buildQuery({ page, page_size: pageSize })
+  return request<PaginatedResponse<Driver>>(`/drivers/archived/${query}`, {
+    signal,
+  })
+}
+
+export async function archiveDriver(id: number): Promise<Driver> {
+  return request<Driver>(`/drivers/${id}/archive/`, { method: 'POST' })
+}
+
+export async function restoreDriver(id: number): Promise<Driver> {
+  return request<Driver>(`/drivers/${id}/restore/`, { method: 'POST' })
+}
+
 export async function fetchDriver(id: number, signal?: AbortSignal): Promise<Driver> {
   return request<Driver>(`/drivers/${id}/`, { signal })
 }
@@ -265,6 +315,20 @@ export async function fetchDriverStats(signal?: AbortSignal): Promise<DriverStat
 
 function buildDriverBody(payload: DriverPayload): FormData | Record<string, unknown> {
   const strOrEmpty = (v: string | null | undefined): string => v ?? ''
+  const initialPaymentFields: Record<string, string> = {}
+  const optionalPaymentFields: [string, string | undefined][] = [
+    ['initial_payment_amount', payload.initial_payment_amount],
+    ['initial_payment_date', payload.initial_payment_date],
+    ['initial_payment_period_start', payload.initial_payment_period_start],
+    [
+      'initial_payment_idempotency_key',
+      payload.initial_payment_idempotency_key,
+    ],
+  ]
+  for (const [key, value] of optionalPaymentFields) {
+    if (value !== undefined) initialPaymentFields[key] = value
+  }
+
   if (payload.photo) {
     const form = new FormData()
     form.append('driver_code', strOrEmpty(payload.driver_code))
@@ -278,6 +342,9 @@ function buildDriverBody(payload: DriverPayload): FormData | Record<string, unkn
     form.append('fee_start_date', strOrEmpty(payload.fee_start_date))
     form.append('status', String(payload.status))
     form.append('photo', payload.photo)
+    for (const [key, value] of Object.entries(initialPaymentFields)) {
+      form.append(key, value)
+    }
     return form
   }
 
@@ -292,6 +359,7 @@ function buildDriverBody(payload: DriverPayload): FormData | Record<string, unkn
     registration_date: strOrEmpty(payload.registration_date),
     fee_start_date: strOrEmpty(payload.fee_start_date),
     status: payload.status,
+    ...initialPaymentFields,
   }
 }
 
@@ -339,8 +407,10 @@ export interface DocumentUploadItem {
   id: number
   document_name: string
   original_filename: string
+  content_type: string
   file_size_mb: number
   upload_date: string
+  description: string
   status: string
 }
 
@@ -349,17 +419,92 @@ export interface DocumentUploadResponse {
   documents: DocumentUploadItem[]
 }
 
+const DOCUMENT_CONTENT_TYPES: Record<string, string> = {
+  pdf: 'application/pdf',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+}
+
+function normalizeDocumentItems(value: unknown): DocumentUploadItem[] {
+  if (!Array.isArray(value)) {
+    throw new ApiError('ساختار فهرست اسناد از سرور معتبر نیست.', 502, value)
+  }
+
+  return value.map((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new ApiError(
+        `اطلاعات سند شماره ${index + 1} از سرور معتبر نیست.`,
+        502,
+        item,
+      )
+    }
+
+    const record = item as Record<string, unknown>
+    const id =
+      typeof record.id === 'number'
+        ? record.id
+        : typeof record.id === 'string' && /^\d+$/.test(record.id)
+          ? Number(record.id)
+          : NaN
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      throw new ApiError(
+        `شناسه سند شماره ${index + 1} از سرور معتبر نیست.`,
+        502,
+        item,
+      )
+    }
+
+    const originalFilename =
+      typeof record.original_filename === 'string'
+        ? record.original_filename
+        : ''
+    const documentName =
+      typeof record.document_name === 'string' && record.document_name.trim()
+        ? record.document_name
+        : originalFilename || `سند ${id}`
+    const extension = originalFilename.split('.').pop()?.toLowerCase() ?? ''
+    const contentType =
+      typeof record.content_type === 'string' &&
+      Object.values(DOCUMENT_CONTENT_TYPES).includes(record.content_type)
+        ? record.content_type
+        : DOCUMENT_CONTENT_TYPES[extension] ?? 'application/octet-stream'
+    const fileSize =
+      typeof record.file_size_mb === 'number' &&
+      Number.isFinite(record.file_size_mb) &&
+      record.file_size_mb >= 0
+        ? record.file_size_mb
+        : 0
+
+    return {
+      id,
+      document_name: documentName,
+      original_filename: originalFilename,
+      content_type: contentType,
+      file_size_mb: fileSize,
+      upload_date:
+        typeof record.upload_date === 'string' ? record.upload_date : '',
+      description: typeof record.description === 'string' ? record.description : '',
+      status:
+        record.status === 'inactive' || record.status === 'active'
+          ? record.status
+          : 'active',
+    }
+  })
+}
+
 export async function uploadDocuments(
   driverId: number,
   files: FileList | File[],
-): Promise<DocumentUploadResponse> {
+): Promise<void> {
   const form = new FormData()
   form.append("driver_id", String(driverId))
   const fileList = Array.isArray(files) ? files : Array.from(files)
   for (const file of fileList) {
     form.append("documents", file)
   }
-  return request<DocumentUploadResponse>("/api/documents/upload/", {
+  await request<unknown>("/documents/upload/", {
     method: "POST",
     body: form,
   })
@@ -370,7 +515,13 @@ export async function fetchDriverDocuments(
   signal?: AbortSignal,
 ): Promise<DocumentUploadItem[]> {
   const query = new URLSearchParams({ driver_id: String(driverId) })
-  return request<DocumentUploadItem[]>(`/api/documents/?${query}`, { signal })
+  const response = await request<unknown>(`/documents/?${query}`, { signal })
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    throw new ApiError('پاسخ فهرست اسناد از سرور معتبر نیست.', 502, response)
+  }
+  return normalizeDocumentItems(
+    (response as Record<string, unknown>).documents,
+  )
 }
 
 export async function downloadDocument(
@@ -384,7 +535,23 @@ export async function downloadDocument(
     },
   })
   if (!response.ok) {
-    const payload = await response.text()
+    const contentType = response.headers.get('content-type') ?? ''
+    let payload: unknown
+    if (contentType.includes('application/json')) {
+      try {
+        payload = await response.json()
+      } catch {
+        payload = 'پاسخ خطای سرور قابل‌خواندن نیست.'
+      }
+    } else {
+      payload = await response.text()
+    }
+    if (
+      response.status === 401 &&
+      !window.location.pathname.startsWith('/login')
+    ) {
+      window.dispatchEvent(new CustomEvent('dm:unauthorized'))
+    }
     throw new ApiError(extractMessage(payload), response.status, payload)
   }
   return response.blob()
@@ -463,12 +630,14 @@ export async function fetchFinancialReport(
   asOf?: string,
   dateFrom?: string,
   dateTo?: string,
+  archiveStatus: FinancialReportArchiveStatus = 'active',
   signal?: AbortSignal,
 ): Promise<FinancialReport> {
   const query = new URLSearchParams()
   if (asOf) query.set('as_of', asOf)
   if (dateFrom) query.set('date_from', dateFrom)
   if (dateTo) query.set('date_to', dateTo)
+  query.set('archive_status', archiveStatus)
   const encoded = query.toString()
   return request(`/reports/financial/${encoded ? `?${encoded}` : ''}`, { signal })
 }
@@ -478,6 +647,28 @@ export async function receivePayment(payload: ReceivePaymentInput): Promise<Paym
     method: 'POST',
     body: payload,
   })
+}
+
+export async function fetchPayments(
+  params: PaymentListParams,
+  signal?: AbortSignal,
+): Promise<PaginatedResponse<PaymentListItem>> {
+  const query = buildQuery({
+    driver_id: params.driver_id,
+    date_from: params.date_from,
+    date_to: params.date_to,
+    search: params.search,
+    page: params.page,
+    page_size: params.page_size,
+  })
+  return request<PaginatedResponse<PaymentListItem>>(`/payments/${query}`, { signal })
+}
+
+export async function fetchPayment(
+  paymentId: number,
+  signal?: AbortSignal,
+): Promise<PaymentListItem> {
+  return request<PaymentListItem>(`/payments/${paymentId}/`, { signal })
 }
 
 export async function voidPayment(
@@ -494,7 +685,17 @@ export async function correctPayment(
   paymentId: number,
   payload: CorrectPaymentInput,
 ): Promise<PaymentListItem> {
-  return request(`/payments/${paymentId}/correct/`, {
+  return request<PaymentListItem>(`/payments/${paymentId}/correct/`, {
+    method: 'POST',
+    body: payload,
+  })
+}
+
+export async function refundPayment(
+  paymentId: number,
+  payload: PaymentRefundInput,
+): Promise<PaymentRefundListItem> {
+  return request<PaymentRefundListItem>(`/payments/${paymentId}/refund/`, {
     method: 'POST',
     body: payload,
   })
@@ -589,4 +790,41 @@ export async function changeFeeStartDate(
     method: 'POST',
     body: payload,
   })
+}
+
+// ---------------------------------------------------------------------------
+// Activity logs (Superuser-only audit trail)
+// ---------------------------------------------------------------------------
+
+export async function fetchActivityLogs(
+  params: ActivityLogListParams,
+  signal?: AbortSignal,
+): Promise<PaginatedResponse<ActivityLogListItem>> {
+  const query = buildQuery({
+    actor: params.actor,
+    action: params.action,
+    module: params.module,
+    status: params.status,
+    date_from: params.date_from,
+    date_to: params.date_to,
+    search: params.search,
+    page: params.page,
+    page_size: params.page_size,
+  })
+  return request<PaginatedResponse<ActivityLogListItem>>(`/activity-logs/${query}`, {
+    signal,
+  })
+}
+
+export async function fetchActivityLog(
+  id: number,
+  signal?: AbortSignal,
+): Promise<ActivityLogDetail> {
+  return request<ActivityLogDetail>(`/activity-logs/${id}/`, { signal })
+}
+
+export async function fetchActivityLogFilters(
+  signal?: AbortSignal,
+): Promise<ActivityLogFilterOptions> {
+  return request<ActivityLogFilterOptions>('/activity-logs/filters/', { signal })
 }

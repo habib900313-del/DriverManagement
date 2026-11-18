@@ -1,0 +1,48 @@
+# Replace example.com and certificate paths before enabling this configuration.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name example.com;
+
+    ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+
+    client_max_body_size 50m;
+
+    root /srv/driver-management/frontend/dist;
+    index index.html;
+
+    location /static/ {
+        alias /srv/driver-management/backend/staticfiles/;
+        expires 7d;
+        add_header Cache-Control "public";
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 90s;
+    }
+
+    location /admin/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 90s;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

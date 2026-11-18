@@ -11,13 +11,14 @@ from .ledger import (
     payment_recorded_as_of,
     payment_valid_as_of,
 )
-from .models import AllocationType, Payment
+from .models import AllocationType, Payment, PaymentRefund
 from .periods import consecutive_periods, fee_for_period
 from apps.drivers.models import Driver
 
 # How many upcoming quarters the driver profile table shows beyond the
 # quarters the driver already has records for.
 FUTURE_PERIOD_LOOKAHEAD = 4
+FINANCIAL_REPORT_ARCHIVE_STATUSES = ("active", "archived", "all")
 
 __all__ = [
     "driver_financial_summary",
@@ -94,7 +95,9 @@ def conservation_report(driver, as_of: date | None = None) -> dict:
     settled_credit = sum((s.credit_settled for s in states), ZERO)
 
     valid_payments = [p for p in ledger.payments if ledger.payment_valid(p)]
-    cash_received = sum((p.amount for p in valid_payments), ZERO)
+    cash_received = sum(
+        (ledger.net_payment_amount(payment) for payment in valid_payments), ZERO
+    )
     consumed = sum(
         (
             c.consumption_amount
@@ -117,6 +120,7 @@ def conservation_report(driver, as_of: date | None = None) -> dict:
     # (P) per payment and (CR) per credit source
     payment_checks = []
     for p in valid_payments:
+        net_amount = ledger.net_payment_amount(p)
         active_total = ledger.active_allocation_total(p)
         fee_alloc = sum(
             (
@@ -141,12 +145,12 @@ def conservation_report(driver, as_of: date | None = None) -> dict:
         payment_checks.append(
             {
                 "payment_id": p.id,
-                "amount": _money(p.amount),
+                "amount": _money(net_amount),
                 "fee_allocated": _money(fee_alloc),
                 "credit_allocated": _money(credit_alloc),
-                "unallocated": _money(p.amount - active_total),
-                "cap_ok": active_total <= p.amount,
-                "partition_ok": p.amount == fee_alloc + credit_alloc + (p.amount - active_total),
+                "unallocated": _money(net_amount - active_total),
+                "cap_ok": active_total <= net_amount,
+                "partition_ok": net_amount == fee_alloc + credit_alloc + (net_amount - active_total),
             }
         )
 
@@ -293,6 +297,7 @@ def driver_period_coverage(
                 "effective_date": a.effective_date.isoformat(),
                 "payment_date": a.payment.payment_date.isoformat(),
                 "receipt_number": a.payment.receipt_number,
+                "description": a.payment.description,
                 "payment_amount": _money(a.payment.amount),
                 "reversed_at": a.reversed_at.isoformat() if a.reversed_at else None,
                 "reversal_reason": a.reversal_reason,
@@ -350,14 +355,36 @@ def cash_revenue_report(
     as_of: date | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
+    driver_ids: set[int] | None = None,
 ) -> dict:
-    """Global cash revenue. No range => F2 (F1 at today); range => F4 (F3 at today)."""
+    """Cash revenue, optionally scoped to drivers; no range => F2/F1, range => F4/F3."""
     d = as_of or timezone.localdate()
-    payments = list(Payment.objects.all())
+    payment_query = Payment.objects.all()
+    refund_query = PaymentRefund.objects.select_related("payment").filter(
+        effective_date__lte=d
+    )
+    if driver_ids is not None:
+        payment_query = payment_query.filter(driver_id__in=driver_ids)
+        refund_query = refund_query.filter(payment__driver_id__in=driver_ids)
+
+    payments = list(payment_query)
     valid = [p for p in payments if payment_valid_as_of(p, d)]
+    refunds = list(refund_query)
+    valid_refunds = [
+        refund
+        for refund in refunds
+        if payment_valid_as_of(refund.payment, d)
+    ]
     if date_from is not None and date_to is not None:
         valid = [p for p in valid if date_from <= p.payment_date <= date_to]
-    total = sum((p.amount for p in valid), ZERO)
+        valid_refunds = [
+            refund
+            for refund in valid_refunds
+            if date_from <= refund.refund_date <= date_to
+        ]
+    total = sum((p.amount for p in valid), ZERO) - sum(
+        (refund.amount for refund in valid_refunds), ZERO
+    )
     recorded = sum(
         (
             p.amount
@@ -371,6 +398,16 @@ def cash_revenue_report(
         ),
         ZERO,
     )
+    recorded_refunds = sum(
+        (
+            refund.amount
+            for refund in valid_refunds
+            if payment_recorded_as_of(refund.payment, d)
+            and timezone.localtime(refund.created_at).date() <= d
+        ),
+        ZERO,
+    )
+    recorded -= recorded_refunds
     return {
         "as_of": d.isoformat(),
         "date_from": date_from.isoformat() if date_from else None,
@@ -380,18 +417,22 @@ def cash_revenue_report(
         "payment_count": len(valid),
         # Only the number of paying drivers — never their identities.
         "driver_count": len({p.driver_id for p in valid}),
-        "by_month": _revenue_by_month(valid),
+        "by_month": _revenue_by_month(valid, valid_refunds),
     }
 
 
-def _revenue_by_month(payments) -> list[dict]:
-    """Cash revenue grouped by the month the payment was received."""
+def _revenue_by_month(payments, refunds=()) -> list[dict]:
+    """Net cash revenue grouped by payment and refund dates."""
     buckets: dict = {}
     for payment in payments:
         key = payment.payment_date.strftime("%Y-%m")
         entry = buckets.setdefault(key, {"month": key, "total": ZERO, "count": 0})
         entry["total"] += payment.amount
         entry["count"] += 1
+    for refund in refunds:
+        key = refund.refund_date.strftime("%Y-%m")
+        entry = buckets.setdefault(key, {"month": key, "total": ZERO, "count": 0})
+        entry["total"] -= refund.amount
     return [
         {
             "month": entry["month"],
@@ -406,6 +447,7 @@ def financial_report(
     date_from: date | None = None,
     date_to: date | None = None,
     as_of: date | None = None,
+    archive_status: str = "active",
 ) -> dict:
     """Consolidated financial report over an optional date range.
 
@@ -422,10 +464,21 @@ def financial_report(
       payment totals, so the report shows both the period activity and the
       resulting financial status.
 
-    The report is a read-only aggregate: it reuses the existing ledger and
-    conservation formulas and never mutates a financial record.
+    ``archive_status`` controls which drivers contribute to every aggregate:
+    active drivers, archived drivers, or all drivers. The report is read-only
+    and reuses the existing ledger and conservation formulas.
     """
     d = as_of or timezone.localdate()
+    if archive_status not in FINANCIAL_REPORT_ARCHIVE_STATUSES:
+        raise ValueError(f"Unsupported archive_status: {archive_status}")
+
+    driver_query = Driver.objects.order_by("id")
+    if archive_status == "active":
+        driver_query = driver_query.filter(is_deleted=False, status=True)
+    elif archive_status == "archived":
+        driver_query = driver_query.filter(is_deleted=True)
+    report_drivers = list(driver_query)
+    driver_ids = {driver.id for driver in report_drivers}
 
     def _in_range(payment):
         if date_from is not None and payment.payment_date < date_from:
@@ -434,19 +487,35 @@ def financial_report(
             return False
         return True
 
-    payments = list(Payment.objects.select_related("driver").all())
+    payments = list(
+        Payment.objects.select_related("driver").filter(driver_id__in=driver_ids)
+    )
     valid = [p for p in payments if payment_valid_as_of(p, d)]
     ranged = [p for p in valid if _in_range(p)]
-    payments_total = sum((p.amount for p in ranged), ZERO)
+    ranged_refunds = [
+        refund
+        for refund in PaymentRefund.objects.select_related("payment").filter(
+            effective_date__lte=d,
+            payment__driver_id__in=driver_ids,
+        )
+        if payment_valid_as_of(refund.payment, d)
+        and (date_from is None or refund.refund_date >= date_from)
+        and (date_to is None or refund.refund_date <= date_to)
+    ]
+    payments_total = sum((p.amount for p in ranged), ZERO) - sum(
+        (refund.amount for refund in ranged_refunds), ZERO
+    )
 
-    revenue = cash_revenue_report(d, date_from, date_to)
+    revenue = cash_revenue_report(
+        d, date_from, date_to, driver_ids=driver_ids
+    )
 
     drivers = []
     total_balance = current_total = overdue_total = ZERO
     available_total = credit_allocated_total = fee_in_range_total = ZERO
     conserving = 0
 
-    for driver in Driver.objects.order_by("id"):
+    for driver in report_drivers:
         ledger = DriverLedger(driver, d)
         states = ledger.all_period_states()
         current = next((s for s in states if s.start <= d <= s.end), None)
@@ -474,7 +543,12 @@ def financial_report(
             ZERO,
         )
         driver_payments = [p for p in ranged if p.driver_id == driver.id]
-        driver_total = sum((p.amount for p in driver_payments), ZERO)
+        driver_refunds = [
+            refund for refund in ranged_refunds if refund.payment.driver_id == driver.id
+        ]
+        driver_total = sum((p.amount for p in driver_payments), ZERO) - sum(
+            (refund.amount for refund in driver_refunds), ZERO
+        )
         ok = bool(conservation_report(driver, d)["all_ok"])
         conserving += int(ok)
 
@@ -506,6 +580,7 @@ def financial_report(
         "as_of": d.isoformat(),
         "date_from": date_from.isoformat() if date_from else None,
         "date_to": date_to.isoformat() if date_to else None,
+        "archive_status": archive_status,
         "payments": {
             "count": len(ranged),
             "total_amount": _money(payments_total),

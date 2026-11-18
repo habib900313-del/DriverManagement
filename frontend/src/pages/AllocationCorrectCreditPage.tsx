@@ -115,7 +115,7 @@ export function AllocationCorrectCreditPage() {
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
             <Field label="دلیل اصلاح (زامی)" required>
               <input
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                className="block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 dir-ltr shadow-xs outline-none transition hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
                 defaultValue={form.reason}
                 onChange={(e) => handleChange('reason', e.target.value)}
                 placeholder="دلیل اصلاح تخصیص اعتباری"
@@ -127,7 +127,7 @@ export function AllocationCorrectCreditPage() {
                 type="text"
                 inputMode="numeric"
                 pattern="[0-9]*"
-                className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 font-mono dir-ltr focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                className="block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 font-mono dir-ltr shadow-xs outline-none transition hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
                 defaultValue={form.new_credit_amount}
                 onChange={(e) => handleChange('new_credit_amount', e.target.value)}
                 placeholder="مقدار اعتبار جدید"
@@ -135,7 +135,7 @@ export function AllocationCorrectCreditPage() {
             </Field>
           </div>
 
-          <div className="alert alert-warning bg-rose-50 border-rose-200 p-4 rounded-lg">
+          <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 shadow-xs">
             <h3 className="text-sm font-semibold text-rose-800">روند اصلاح اعتباری</h3>
             <p className="mt-1 text-sm text-rose-700">
               ۱. تمام مصارف وابسته به تخصیص کنونی بازمی‌گردانند.<br />

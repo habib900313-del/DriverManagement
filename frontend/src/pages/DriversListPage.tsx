@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { DriverAvatar } from '../components/DriverAvatar'
 import {
   EyeIcon,
+  ArchiveIcon,
   PencilIcon,
   PlusIcon,
   PowerIcon,
@@ -17,8 +18,9 @@ import { EmptyState } from '../components/ui/EmptyState'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Pagination } from '../components/ui/Pagination'
 import { Spinner } from '../components/ui/Spinner'
+import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
-import { fetchDrivers, setDriverStatus } from '../lib/api'
+import { archiveDriver, fetchDrivers, setDriverStatus } from '../lib/api'
 import { cn } from '../lib/cn'
 import { formatJalaliShort, toPersianDigits } from '../lib/dates'
 import { getErrorMessage, isAbortError } from '../lib/errors'
@@ -35,6 +37,8 @@ const statusOptions: Array<{ value: StatusFilter; label: string }> = [
 ]
 
 export function DriversListPage() {
+  const { user } = useAuth()
+  const canManage = Boolean(user?.is_staff || user?.is_superuser)
   const [searchInput, setSearchInput] = useState('')
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<StatusFilter>('')
@@ -129,6 +133,25 @@ export function DriversListPage() {
     }
   }
 
+  const handleArchive = async (driver: Driver) => {
+    if (busyId !== null) return
+    const confirmed = window.confirm(
+      `راننده «${driver.full_name}» با شماره مسلسل ${driver.driver_code} آرشیف شود؟`,
+    )
+    if (!confirmed) return
+
+    setBusyId(driver.id)
+    try {
+      await archiveDriver(driver.id)
+      notify('success', `راننده «${driver.full_name}» آرشیف شد.`)
+      setReloadKey((current) => current + 1)
+    } catch (cause) {
+      notify('error', getErrorMessage(cause))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   const totalPages = data ? Math.max(1, Math.ceil(data.count / PAGE_SIZE)) : 1
   const hasFilters = Boolean(search) || status !== ''
 
@@ -137,14 +160,14 @@ export function DriversListPage() {
       <PageHeader
         title="فهرست رانندگان"
         description="جستجو و مدیریت رانندگان ثبت‌شده. جستجو در سرور انجام می‌شود و شامل نام، پلیت و شماره مسلسل است."
-        actions={
+        actions={canManage ? (
           <LinkButton
             to="/drivers/new"
             icon={<PlusIcon className="size-4" />}
           >
             ثبت راننده جدید
           </LinkButton>
-        }
+        ) : undefined}
       />
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
@@ -157,7 +180,7 @@ export function DriversListPage() {
               onChange={(event) => setSearchInput(event.target.value)}
               placeholder="جستجو بر اساس نام، پلیت یا شماره مسلسل…"
               aria-label="جستجوی رانندگان"
-              className="h-10 w-full rounded-lg border border-slate-300 bg-white pe-9 ps-10 text-sm text-slate-900 shadow-sm outline-none transition placeholder:text-slate-400 focus:border-slate-500 focus:ring-2 focus:ring-slate-900/10"
+              className="h-10 w-full rounded-xl border border-slate-300 bg-white pe-9 ps-10 text-sm text-slate-900 shadow-xs outline-none transition placeholder:text-slate-400 hover:border-slate-400 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
             />
             {searchInput && (
               <button
@@ -234,7 +257,7 @@ export function DriversListPage() {
         <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
           <div className="overflow-x-auto">
             <table className="w-full min-w-[820px] text-sm">
-              <thead className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500">
+              <thead className="border-b border-slate-200 bg-slate-50/70 text-xs text-slate-500">
                 <tr>
                   <th className="px-4 py-3 text-right font-medium">
                     شماره مسلسل
@@ -327,41 +350,59 @@ export function DriversListPage() {
                             >
                               <EyeIcon className="size-4" />
                             </Link>
-                            <Link
-                              to={`/drivers/${driver.id}/edit`}
-                              className="inline-flex size-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
-                              aria-label={`ویرایش ${driver.full_name}`}
-                              title="ویرایش"
-                            >
-                              <PencilIcon className="size-4" />
-                            </Link>
-                            <button
-                              type="button"
-                              onClick={() => handleToggle(driver)}
-                              disabled={busyId !== null}
-                              className={cn(
-                                'inline-flex size-8 items-center justify-center rounded-lg transition disabled:opacity-40',
-                                driver.status
-                                  ? 'text-amber-600 hover:bg-amber-50'
-                                  : 'text-emerald-600 hover:bg-emerald-50',
-                              )}
-                              aria-label={
-                                driver.status
-                                  ? `غیرفعال کردن ${driver.full_name}`
-                                  : `فعال کردن ${driver.full_name}`
-                              }
-                              title={
-                                driver.status
-                                  ? 'غیرفعال کردن راننده'
-                                  : 'فعال کردن راننده'
-                              }
-                            >
-                              {busyId === driver.id ? (
-                                <Spinner className="size-4" />
-                              ) : (
-                                <PowerIcon className="size-4" />
-                              )}
-                            </button>
+                            {canManage && (
+                              <>
+                                <Link
+                                  to={`/drivers/${driver.id}/edit`}
+                                  className="inline-flex size-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+                                  aria-label={`ویرایش ${driver.full_name}`}
+                                  title="ویرایش"
+                                >
+                                  <PencilIcon className="size-4" />
+                                </Link>
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggle(driver)}
+                                  disabled={busyId !== null}
+                                  className={cn(
+                                    'inline-flex size-8 items-center justify-center rounded-lg transition disabled:opacity-40',
+                                    driver.status
+                                      ? 'text-amber-600 hover:bg-amber-50'
+                                      : 'text-emerald-600 hover:bg-emerald-50',
+                                  )}
+                                  aria-label={
+                                    driver.status
+                                      ? `غیرفعال کردن ${driver.full_name}`
+                                      : `فعال کردن ${driver.full_name}`
+                                  }
+                                  title={
+                                    driver.status
+                                      ? 'غیرفعال کردن راننده'
+                                      : 'فعال کردن راننده'
+                                  }
+                                >
+                                  {busyId === driver.id ? (
+                                    <Spinner className="size-4" />
+                                  ) : (
+                                    <PowerIcon className="size-4" />
+                                  )}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleArchive(driver)}
+                                  disabled={busyId !== null}
+                                  className="inline-flex size-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-rose-700 disabled:opacity-40"
+                                  aria-label={`آرشیف کردن ${driver.full_name}`}
+                                  title="آرشیف راننده"
+                                >
+                                  {busyId === driver.id ? (
+                                    <Spinner className="size-4" />
+                                  ) : (
+                                    <ArchiveIcon className="size-4" />
+                                  )}
+                                </button>
+                              </>
+                            )}
                           </div>
                         </td>
                       </tr>
@@ -396,7 +437,7 @@ export function DriversListPage() {
                   >
                     حذف فیلترها
                   </Button>
-                ) : (
+                ) : canManage ? (
                   <LinkButton
                     to="/drivers/new"
                     size="sm"
@@ -404,7 +445,7 @@ export function DriversListPage() {
                   >
                     ثبت اولین راننده
                   </LinkButton>
-                )
+                ) : undefined
               }
             />
           )}

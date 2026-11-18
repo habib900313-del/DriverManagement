@@ -1,18 +1,21 @@
 """Computed quarterly periods from the driver's era anchor (spec §8.2/§8.3, D3/D4).
 
 There is no Period table. Periods are generated from the anchor:
-    start_k = add_calendar_months(anchor, 3k)   (day-clamped)
+    start_k = add_period_months(anchor, 3k)   (day-clamped)
     end_k   = start_{k+1} - 1 day
 Every era change lands on the same grid (ceil_to_grid of the current grid), so
 the original anchor reconstructs the union of all era period pairs by construction
 — no overlap, no gap, no drift.
+
+Existing drivers retain Gregorian period rules; new drivers use Jalali months.
 """
 
 import calendar
-from datetime import date, timedelta, timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 
 from django.utils import timezone
+from jdatetime import date as JalaliDate
 
 from .models import FeeSchedule
 
@@ -28,6 +31,38 @@ def add_calendar_months(value: date, months: int) -> date:
     return date(year, month, day)
 
 
+def add_jalali_months(value: date, months: int) -> date:
+    """Add Jalali calendar months, clamping to the last valid target day."""
+    jalali = JalaliDate.fromgregorian(date=value)
+    total = jalali.year * 12 + jalali.month - 1 + months
+    year, month = divmod(total, 12)
+    month += 1
+    day = jalali.day
+    while day > 28:
+        try:
+            return JalaliDate(year, month, day).togregorian()
+        except ValueError:
+            day -= 1
+    return JalaliDate(year, month, day).togregorian()
+
+
+def _period_calendar(driver) -> str:
+    return getattr(driver, "period_calendar", "gregorian")
+
+
+def _add_period_months(value: date, months: int, period_calendar: str) -> date:
+    if period_calendar == "jalali":
+        return add_jalali_months(value, months)
+    return add_calendar_months(value, months)
+
+
+def _calendar_month_index(value: date, period_calendar: str) -> int:
+    if period_calendar == "jalali":
+        jalali = JalaliDate.fromgregorian(date=value)
+        return jalali.year * 12 + jalali.month - 1
+    return value.year * 12 + value.month - 1
+
+
 def get_era_anchor(driver) -> date:
     """Original era anchor = first fee-history effective date (grid is invariant)."""
     first = driver.fee_history.order_by("changed_at", "id").first()
@@ -36,14 +71,16 @@ def get_era_anchor(driver) -> date:
     return driver.fee_start_date
 
 
-def iter_periods(anchor: date, until: date):
+def iter_periods(
+    anchor: date, until: date, period_calendar: str = "gregorian"
+):
     """Yield (start, end) for every period with start <= until."""
     k = 0
     while True:
-        start = add_calendar_months(anchor, 3 * k)
+        start = _add_period_months(anchor, 3 * k, period_calendar)
         if start > until:
             return
-        next_start = add_calendar_months(anchor, 3 * (k + 1))
+        next_start = _add_period_months(anchor, 3 * (k + 1), period_calendar)
         yield start, next_start - timedelta(days=1)
         k += 1
 
@@ -52,7 +89,7 @@ def reconstruct_periods(driver, until: date | None = None) -> list[tuple[date, d
     anchor = get_era_anchor(driver)
     if until is None:
         until = timezone.localdate()
-    return list(iter_periods(anchor, until))
+    return list(iter_periods(anchor, until, _period_calendar(driver)))
 
 
 def period_containing(driver, on: date) -> tuple[date, date] | None:
@@ -112,26 +149,41 @@ def consecutive_periods(driver, start: date, count: int) -> list[tuple[date, dat
     if count < 1:
         return []
     anchor = get_era_anchor(driver)
-    months = (start.year - anchor.year) * 12 + (start.month - anchor.month)
+    period_calendar = _period_calendar(driver)
+    months = _calendar_month_index(start, period_calendar) - _calendar_month_index(
+        anchor, period_calendar
+    )
     if months < 0 or months % 3:
         return []
     k = months // 3
     periods = []
     for i in range(count):
-        period_start = add_calendar_months(anchor, 3 * (k + i))
-        period_end = add_calendar_months(anchor, 3 * (k + i + 1)) - timedelta(days=1)
+        period_start = _add_period_months(anchor, 3 * (k + i), period_calendar)
+        period_end = _add_period_months(
+            anchor, 3 * (k + i + 1), period_calendar
+        ) - timedelta(days=1)
         periods.append((period_start, period_end))
+    if periods[0][0] != start:
+        return []
     return periods
 
 
-def ceil_to_grid(anchor: date, value: date) -> date:
+def period_for_start(driver, start: date) -> tuple[date, date] | None:
+    """Return a driver's exact quarter for a valid period start."""
+    periods = consecutive_periods(driver, start, 1)
+    return periods[0] if periods and periods[0][0] == start else None
+
+
+def ceil_to_grid(
+    anchor: date, value: date, period_calendar: str = "gregorian"
+) -> date:
     """Smallest grid point (anchor + 3k months) >= value."""
     if value <= anchor:
         return anchor
     k = 0
-    while add_calendar_months(anchor, 3 * k) < value:
+    while _add_period_months(anchor, 3 * k, period_calendar) < value:
         k += 1
-    return add_calendar_months(anchor, 3 * k)
+    return _add_period_months(anchor, 3 * k, period_calendar)
 
 
 def compute_effective_anchor(driver, requested: date) -> date:
@@ -144,7 +196,7 @@ def compute_effective_anchor(driver, requested: date) -> date:
         candidate = max(requested, current_end + timedelta(days=1))
     else:
         candidate = max(requested, anchor)
-    return ceil_to_grid(anchor, candidate)
+    return ceil_to_grid(anchor, candidate, _period_calendar(driver))
 
 
 def fee_for_period(period_start: date) -> Decimal:

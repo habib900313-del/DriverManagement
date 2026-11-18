@@ -23,3 +23,9 @@ export interface CreateManagedUserInput {
   password_confirmation: string
   role: 'admin' | 'guest'
 }
+
+export interface UpdateManagedUserInput {
+  full_name?: string
+  role?: 'admin' | 'guest'
+  is_active?: boolean
+}

@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { PlusIcon, RefreshIcon, UsersIcon } from '../components/icons'
 import { Button, LinkButton } from '../components/ui/Button'
 import { PageHeader } from '../components/ui/PageHeader'
+import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
 import {
   fetchCashRevenueReport,
@@ -22,7 +23,7 @@ function MoneyCard({
   tone: string
 }) {
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+    <div className="animate-fade-in-up rounded-2xl border border-slate-200 bg-white p-5 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md">
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="text-sm font-medium text-slate-500">{label}</p>
@@ -31,7 +32,7 @@ function MoneyCard({
           </p>
         </div>
         <span
-          className={`flex size-11 items-center justify-center rounded-xl ring-4 ${tone} ring-slate-200`}
+          className={`flex size-11 items-center justify-center rounded-xl shadow-sm ring-1 ring-black/5 ${tone}`}
         >
           <Icon className="size-5" />
         </span>
@@ -41,6 +42,8 @@ function MoneyCard({
 }
 
 export function FinancialDashboardPage() {
+  const { user } = useAuth()
+  const canManage = Boolean(user?.is_staff || user?.is_superuser)
   const { notify } = useToast()
   const [report, setReport] = useState<{
     cash_revenue: string
@@ -74,14 +77,14 @@ export function FinancialDashboardPage() {
       <PageHeader
         title="داشبورد مالی"
         description="خلاصه وضعیت مالی، درآمد نقدی، بدهی معوق و اعتبار رانندگان."
-        actions={
+        actions={canManage ? (
           <LinkButton
             to="/financial/payments/new"
             icon={<PlusIcon className="size-4" />}
           >
             ثبت پرداخت جدید
           </LinkButton>
-        }
+        ) : undefined}
       />
 
       {error && (
@@ -109,13 +112,13 @@ export function FinancialDashboardPage() {
           label="تعداد پرداخت‌ها"
           value={report?.payment_count?.toString() ?? '0'}
           icon={UsersIcon}
-          tone="bg-slate-900 text-white"
+          tone="bg-gradient-to-br from-brand-500 to-brand-600 text-white"
         />
         <MoneyCard
           label="اعتبار قابل استفاده"
           value='0'
           icon={UsersIcon}
-          tone="bg-blue-50 text-blue-600"
+          tone="bg-brand-50 text-brand-600"
         />
         <MoneyCard
           label="بدهی معوق کل"
@@ -144,29 +147,24 @@ export function FinancialDashboardPage() {
           </Link>
         </div>
 
-        <div className="overflow-x-auto p-5">
-          <table className="w-full min-w-[640px] text-sm">
-            <thead className="bg-slate-50 text-xs text-slate-500">
-              <tr>
-                <th className="px-5 py-2.5 text-right font-middle">محصول خالص</th>
-                <th className="px-5 py-2.5 text-right font-middle">تعداد پرداخت‌ها</th>
-                <th className="px-5 py-2.5 text-right font-middle">تاریخ گزارش</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              <tr className="transition hover:bg-slate-50/70">
-                <td className="px-5 py-3 font-mono text-xs text-slate-600" dir="ltr">
-                  {toPersianDigits(report?.cash_revenue ?? '0')} AFN
-                </td>
-                <td className="px-5 py-3 font-mono text-xs text-slate-600" dir="ltr">
-                  {toPersianDigits(report?.payment_count?.toString() ?? '0')}
-                </td>
-                <td className="px-5 py-3 text-xs text-slate-500">
-                  {formatJalaliShort(new Date().toISOString().split('T')[0])}
-                </td>
-              </tr>
-            </tbody>
-          </table>
+        <div className="p-5" dir="rtl">
+          {/* Shared 3-column grid: header and data row use the exact same template */}
+          <div className="grid grid-cols-3 gap-4 rounded-t-lg bg-slate-50 px-5 py-2.5 text-xs text-slate-500">
+            <div className="text-right font-medium">محصول خالص</div>
+            <div className="text-right font-medium">تعداد پرداخت‌ها</div>
+            <div className="text-right font-medium">تاریخ گزارش</div>
+          </div>
+          <div className="grid grid-cols-3 gap-4 border-b border-slate-100 bg-white px-5 py-3 text-sm transition hover:bg-slate-50/70">
+            <div className="text-right font-mono text-xs text-slate-600">
+              <span dir="ltr">{toPersianDigits(report?.cash_revenue ?? '0')} AFN</span>
+            </div>
+            <div className="text-right font-mono text-xs text-slate-600">
+              <span dir="ltr">{toPersianDigits(report?.payment_count?.toString() ?? '0')}</span>
+            </div>
+            <div className="text-right text-xs text-slate-500">
+              {formatJalaliShort(new Date().toISOString().split('T')[0])}
+            </div>
+          </div>
         </div>
       </section>
 
@@ -176,13 +174,15 @@ export function FinancialDashboardPage() {
             عملیات سریع
           </h3>
           <div className="space-y-2">
-            <LinkButton
-              to="/financial/payments/new"
-              icon={<PlusIcon className="size-4" />}
-              variant="secondary"
-            >
-              ثبت پرداخت جدید
-            </LinkButton>
+            {canManage && (
+              <LinkButton
+                to="/financial/payments/new"
+                icon={<PlusIcon className="size-4" />}
+                variant="secondary"
+              >
+                ثبت پرداخت جدید
+              </LinkButton>
+            )}
             <LinkButton
               to="/financial/history"
               icon={<PlusIcon className="size-4" />}

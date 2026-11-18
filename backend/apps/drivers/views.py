@@ -3,16 +3,20 @@
 import mimetypes
 from pathlib import Path
 
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, OperationalError, transaction
 from django.db.models import Q
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 
-from apps.payments.permissions import IsManager, IsManagerOrReadOnly
+from apps.core.activity import log_activity
+from apps.core.models import ActivityLog
+from apps.payments.permissions import IsManager
+from apps.payments.services import FinancialError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -36,6 +40,27 @@ ORDERING_FIELDS = {
 }
 
 
+def _driver_snapshot(driver):
+    """Comparable, non-sensitive snapshot used for before/after logging."""
+    return {
+        "driver_code": driver.driver_code,
+        "full_name": driver.full_name,
+        "father_name": driver.father_name,
+        "phone": driver.phone,
+        "tazkira_number": driver.tazkira_number,
+        "plate_number": driver.plate_number,
+        "address": driver.address,
+        "driver_type": driver.driver_type,
+        "status": driver.status,
+        "fee_start_date": driver.fee_start_date,
+        "registration_date": driver.registration_date,
+    }
+
+
+def _driver_label(driver):
+    return f"{driver.driver_code} — {driver.full_name}"
+
+
 class DriverPageNumberPagination(PageNumberPagination):
     page_size = 25
     page_size_query_param = "page_size"
@@ -54,7 +79,7 @@ class DriverListCreateView(generics.ListCreateAPIView):
         return [IsAuthenticated()]
 
     def get_queryset(self):
-        queryset = Driver.objects.all()
+        queryset = Driver.objects.filter(is_deleted=False)
         params = self.request.query_params
 
         search = params.get("search", "").strip()
@@ -106,7 +131,27 @@ class DriverListCreateView(generics.ListCreateAPIView):
     def create(self, request, *args, **kwargs):
         try:
             with transaction.atomic():
-                return super().create(request, *args, **kwargs)
+                response = super().create(request, *args, **kwargs)
+                new_id = response.data.get("id") if hasattr(response.data, "get") else None
+                if new_id is not None:
+                    driver = Driver.objects.get(pk=new_id)
+                    log_activity(
+                        actor=request.user,
+                        action="driver_create",
+                        module=ActivityLog.Module.DRIVERS,
+                        description=f"ایجاد راننده «{driver.full_name}».",
+                        target_type="driver",
+                        target_id=driver.pk,
+                        target_label=_driver_label(driver),
+                        after_data=_driver_snapshot(driver),
+                        request=request,
+                    )
+                return response
+        except FinancialError as exc:
+            return Response(
+                {"detail": exc.detail, "code": exc.code},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         except IntegrityError:
             return Response(
                 {
@@ -114,10 +159,15 @@ class DriverListCreateView(generics.ListCreateAPIView):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        except OperationalError:
+            return Response(
+                {"detail": "دیتابیس موقتاً قفل است؛ لطفاً دوباره تلاش کنید."},
+                status=status.HTTP_409_CONFLICT,
+            )
 
 
 class DriverDetailView(generics.RetrieveUpdateAPIView):
-    queryset = Driver.objects.all()
+    queryset = Driver.objects.filter(is_deleted=False)
     serializer_class = DriverSerializer
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
@@ -131,11 +181,31 @@ class DriverDetailView(generics.RetrieveUpdateAPIView):
 
     def update(self, request, *args, **kwargs):
         instance = self.get_object()
-        old_photo_name = instance.photo.name if instance.photo else None
+        old_photo_name = None
 
         try:
             with transaction.atomic():
+                instance = get_object_or_404(
+                    Driver.objects.select_for_update(),
+                    pk=instance.pk,
+                    is_deleted=False,
+                )
+                old_photo_name = instance.photo.name if instance.photo else None
+                before = _driver_snapshot(instance)
                 response = super().update(request, *args, **kwargs)
+                instance.refresh_from_db()
+                log_activity(
+                    actor=request.user,
+                    action="driver_update",
+                    module=ActivityLog.Module.DRIVERS,
+                    description=f"ویرایش اطلاعات راننده «{instance.full_name}».",
+                    target_type="driver",
+                    target_id=instance.pk,
+                    target_label=_driver_label(instance),
+                    before_data=before,
+                    after_data=_driver_snapshot(instance),
+                    request=request,
+                )
         except IntegrityError:
             return Response(
                 {
@@ -162,7 +232,7 @@ class DriverStatusView(APIView):
     permission_classes = [IsManager]
 
     def post(self, request, pk):
-        driver = get_object_or_404(Driver, pk=pk)
+        driver = get_object_or_404(Driver, pk=pk, is_deleted=False)
         new_status = request.data.get("status")
 
         if not isinstance(new_status, bool):
@@ -171,9 +241,31 @@ class DriverStatusView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if driver.status != new_status:
-            driver.status = new_status
-            driver.save(update_fields=["status", "updated_at"])
+        with transaction.atomic():
+            driver = get_object_or_404(
+                Driver.objects.select_for_update(),
+                pk=driver.pk,
+                is_deleted=False,
+            )
+            if driver.status != new_status:
+                old_status = driver.status
+                driver.status = new_status
+                driver.save(update_fields=["status", "updated_at"])
+                log_activity(
+                    actor=request.user,
+                    action="driver_activate" if new_status else "driver_deactivate",
+                    module=ActivityLog.Module.DRIVERS,
+                    description=(
+                        f"{'فعال‌سازی' if new_status else 'غیرفعال‌سازی'} راننده "
+                        f"«{driver.full_name}»."
+                    ),
+                    target_type="driver",
+                    target_id=driver.pk,
+                    target_label=_driver_label(driver),
+                    before_data={"status": old_status},
+                    after_data={"status": new_status},
+                    request=request,
+                )
 
         serializer = DriverSerializer(driver, context={"request": request})
         return Response(serializer.data)
@@ -183,9 +275,10 @@ class DriverStatsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        total = Driver.objects.count()
-        active = Driver.objects.filter(status=True).count()
-        recent = Driver.objects.order_by("-created_at", "-id")[:5]
+        drivers = Driver.objects.filter(is_deleted=False)
+        total = drivers.count()
+        active = drivers.filter(status=True).count()
+        recent = drivers.order_by("-created_at", "-id")[:5]
         return Response(
             {
                 "total": total,
@@ -201,27 +294,126 @@ class DriverStatsView(APIView):
 class DriverUniqueCheckView(APIView):
     """Debounced availability check used by the create/edit forms."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsManager]
 
     def get(self, request):
         code = normalize_driver_code(request.query_params.get("driver_code", ""))
         plate = normalize_plate_number(request.query_params.get("plate_number", ""))
         exclude = request.query_params.get("exclude", "").strip()
 
-        queryset = Driver.objects.all()
+        active_drivers = Driver.objects.filter(is_deleted=False)
+        all_drivers = Driver.objects.all()
         if exclude.isdigit():
-            queryset = queryset.exclude(pk=int(exclude))
+            active_drivers = active_drivers.exclude(pk=int(exclude))
+            all_drivers = all_drivers.exclude(pk=int(exclude))
 
         result = {}
         if code:
-            result["driver_code_taken"] = queryset.filter(
+            result["driver_code_taken"] = active_drivers.filter(
                 driver_code__iexact=code
             ).exists()
         if plate:
-            result["plate_number_taken"] = queryset.filter(
+            result["plate_number_taken"] = all_drivers.filter(
                 plate_number__iexact=plate
             ).exists()
         return Response(result)
+
+
+class ArchivedDriverListView(generics.ListAPIView):
+    serializer_class = DriverSerializer
+    permission_classes = [IsManager]
+    pagination_class = DriverPageNumberPagination
+
+    def get_queryset(self):
+        return Driver.objects.filter(is_deleted=True).order_by(
+            "-deleted_at", "-id"
+        )
+
+
+class DriverArchiveView(APIView):
+    permission_classes = [IsManager]
+
+    def post(self, request, pk):
+        with transaction.atomic():
+            driver = get_object_or_404(
+                Driver.objects.select_for_update(),
+                pk=pk,
+                is_deleted=False,
+            )
+            driver.is_deleted = True
+            driver.deleted_at = timezone.now()
+            driver.save(
+                update_fields=["is_deleted", "deleted_at", "updated_at"]
+            )
+            log_activity(
+                actor=request.user,
+                action="driver_archive",
+                module=ActivityLog.Module.DRIVERS,
+                description=f"آرشیف راننده «{driver.full_name}».",
+                target_type="driver",
+                target_id=driver.pk,
+                target_label=_driver_label(driver),
+                before_data={"is_deleted": False},
+                after_data={"is_deleted": True},
+                request=request,
+            )
+        return Response(DriverSerializer(driver, context={"request": request}).data)
+
+
+class DriverRestoreView(APIView):
+    permission_classes = [IsManager]
+
+    def post(self, request, pk):
+        try:
+            with transaction.atomic():
+                driver = get_object_or_404(
+                    Driver.objects.select_for_update(),
+                    pk=pk,
+                    is_deleted=True,
+                )
+                code_in_use = Driver.objects.filter(
+                    driver_code__iexact=driver.driver_code,
+                    is_deleted=False,
+                ).exclude(pk=driver.pk).exists()
+                if code_in_use:
+                    return Response(
+                        {
+                            "detail": (
+                                f"شماره مسلسل «{driver.driver_code}» اکنون برای "
+                                "راننده فعال دیگری استفاده می‌شود."
+                            )
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                driver.is_deleted = False
+                driver.deleted_at = None
+                driver.save(
+                    update_fields=["is_deleted", "deleted_at", "updated_at"]
+                )
+                log_activity(
+                    actor=request.user,
+                    action="driver_restore",
+                    module=ActivityLog.Module.DRIVERS,
+                    description=f"بازگردانی راننده «{driver.full_name}».",
+                    target_type="driver",
+                    target_id=driver.pk,
+                    target_label=_driver_label(driver),
+                    before_data={"is_deleted": True},
+                    after_data={"is_deleted": False},
+                    request=request,
+                )
+        except IntegrityError:
+            return Response(
+                {
+                    "detail": (
+                        "شماره مسلسل این راننده اکنون برای راننده فعال دیگری "
+                        "استفاده می‌شود."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(DriverSerializer(driver, context={"request": request}).data)
 
 
 class DriverPhotoView(APIView):
