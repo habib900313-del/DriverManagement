@@ -34,7 +34,7 @@
 | C5 | **مصرف اعتبار فقط با تأیید صریح مدیر** ثبت می‌شود |
 | C6 | اضافه‌پرداخت به **اعتبار قابل ردیابی** تبدیل می‌شود (نه درآمد، نه بدهی منفی) |
 | C7 | **درآمد نقدی و تسویه دوره دو مفهوم جدا** هستند؛ مصرف اعتبار درآمد نقدی را زیاد نمی‌کند |
-| C8 | **هیچ رکورد تاریخی بی‌صدا حذف نمی‌شود** — append-only؛ حذف سخت ممنوع |
+| C8 | **هیچ رکورد تاریخی بی‌صدا حذف نمی‌شود** — حذف پرداخت فقط توسط مدیر و همراه با ثبت سابقه حسابرسی؛ حذف سایر رکوردهای مالی ممنوع |
 | C9 | **اصلاح پرداخت و اصلاح allocation دو عملیات جدا** هستند |
 | C10 | **Own-First — CONFIRMED, FINAL BUSINESS RULE (تأیید صریح کاربر، 2026-11-10):** اولویت کاهش تعهدات هر دوره: (۱) فیس خود راننده در همان دوره، (۲) قدیمی‌ترین تعهد انتقالی ورودی، (۳) تعهدات انتقالی جدیدتر. ترتیب انتقال‌ها قطعی با `(effective_date, id)` صعودی. پیامدهای تأییدشده همین بسته: عدم earmark پرداخت به انتقال خاص درون دوره؛ ظرفیت reversal وابسته به ترتیب؛ قاعده مشروط downstream-first (§۵) |
 
@@ -128,7 +128,7 @@ User (django.contrib.auth.User) ← created_by/allocated_by/consumed_by/reversed
 | voided_by / corrected_by | FK(User, PROTECT, null=True, blank=True) |
 | created_by | FK(User, PROTECT)؛ created_at auto_now_add؛ updated_at auto_now |
 
-**قیود (CheckConstraint):** `status='voided' ⇒ voided_at NOT NULL AND void_reason ≠ '' AND voided_by NOT NULL`؛ `status='corrected' ⇒ corrected_at NOT NULL AND correction_reason ≠ '' AND corrected_by NOT NULL`؛ `status='received' ⇒ voided_at IS NULL AND corrected_at IS NULL`. **`is_void` ستون نیست** — property: `is_void = (status != 'received')`. حذف سخت ممنوع: `delete()` raise + admin `has_delete_permission=False`. Indexها: `(driver, payment_date)`، `status`.
+**قیود (CheckConstraint):** `status='voided' ⇒ voided_at NOT NULL AND void_reason ≠ '' AND voided_by NOT NULL`؛ `status='corrected' ⇒ corrected_at NOT NULL AND correction_reason ≠ '' AND corrected_by NOT NULL`؛ `status='received' ⇒ voided_at IS NULL AND corrected_at IS NULL`. **`is_void` ستون نیست** — property: `is_void = (status != 'received')`. حذف مستقیم مدل و حذف از admin ممنوع است؛ مسیر API مدیر برای حذف پرداخت، سابقه حسابرسی را ثبت و پیوندهای اصلاح را پیش از حذف جدا می‌کند. Indexها: `(driver, payment_date)`، `status`.
 
 ### ۴.۲ PaymentAllocation
 
@@ -405,7 +405,7 @@ END;
 ## ۱۰. الزامات محافظت API
 
 1. همه endpointهای مالی `IsAuthenticated` + SessionAuthentication/CSRF. فیلدهای `created_by/reversed_by/...` همیشه از `request.user` — هرگز از client.
-2. **هیچ endpoint DELETE** برای رکوردهای مالی؛ admin: `has_delete_permission=False`، فیلدهای مالی/وضعیت read-only؛ `delete()` مدل raise.
+2. حذف مالی فقط در endpoint مدیر `DELETE /api/payments/{id}/` مجاز است؛ سابقه حسابرسی حفظ و پیوندهای اصلاح پاک‌سازی می‌شوند. admin: `has_delete_permission=False`، فیلدهای مالی/وضعیت read-only؛ حذف مدل‌های دیگر همچنان ممنوع.
 3. `DriverSerializer.fee_start_date` **read-only**؛ تغییر فقط `POST /api/drivers/{id}/fee-start-date/` با reason اجباری (W10).
 4. تغییر وضعیت فقط via action endpoints: `void/`، `correct/`، `reverse/` — reason اجباری؛ status/reversed در serializer معمولی read-only.
 5. اعتبارسنجی هدف: جفت‌تاریخ عضو دوره‌های بازسازی‌شده؛ مبالغ تمام‌AFN و `> 0`; idempotency keyها honor شوند.

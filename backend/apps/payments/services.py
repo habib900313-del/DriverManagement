@@ -489,8 +489,8 @@ def delete_payment(*, payment: Payment, user) -> dict:
       operation, so a deletion cannot race a payment/refund/correction;
     * only rows owned by this payment are removed (its allocations, their
       consumptions, and its refunds) — no other payment or driver is touched;
-    * correction chains are refused: deleting one link would leave the other
-      rows pointing at a missing payment and silently rewrite history;
+    * correction links to and from this payment are detached before deletion;
+      the related payments and their allocations are preserved;
     * a full snapshot is written to the append-only activity log inside the
       same transaction, so the deletion itself stays auditable.
     """
@@ -505,30 +505,31 @@ def delete_payment(*, payment: Payment, user) -> dict:
                 "پرداخت یافت نشد یا قبلاً حذف شده است.", "payment_not_found"
             )
 
-        if payment.corrections.exists():
-            raise FinancialError(
-                "این پرداخت دارای پرداخت اصلاحی است و برای حفظ زنجیره سوابق قابل حذف نیست.",
-                "payment_has_corrections",
-            )
-        if payment.correction_of_id is not None:
-            raise FinancialError(
-                "این پرداخت خود یک پرداخت اصلاحی است و قابل حذف نیست.",
-                "payment_is_correction",
-            )
-
         allocations = list(
             payment.allocations.order_by("created_at", "id")
         )
         refunds = list(payment.refunds.order_by("created_at", "id"))
+        correction_ids = list(
+            payment.corrections.order_by("id").values_list("id", flat=True)
+        )
+        allocation_correction_ids = list(
+            PaymentAllocation.objects.filter(
+                correction_of__payment=payment
+            ).order_by("id").values_list("id", flat=True)
+        )
         snapshot = {
             "payment_id": payment.pk,
             "driver_id": driver.pk,
             "driver_code": driver.driver_code,
+            "driver_name": driver.full_name,
             "amount": payment.amount,
             "payment_date": payment.payment_date,
             "effective_date": payment.effective_date,
             "receipt_number": payment.receipt_number,
             "status": payment.status,
+            "correction_of": payment.correction_of_id,
+            "corrections": correction_ids,
+            "allocation_corrections": allocation_correction_ids,
             "allocations": [
                 {
                     "id": allocation.pk,
@@ -536,6 +537,7 @@ def delete_payment(*, payment: Payment, user) -> dict:
                     "amount": allocation.allocated_amount,
                     "period_start": allocation.target_period_start,
                     "period_end": allocation.target_period_end,
+                    "correction_of": allocation.correction_of_id,
                     "reversed": allocation.reversed_at is not None,
                 }
                 for allocation in allocations
@@ -554,8 +556,13 @@ def delete_payment(*, payment: Payment, user) -> dict:
         AllocationConsumption.objects.filter(
             source_allocation__payment=payment
         ).delete()
-        # Break the self-referencing correction links before deleting the
-        # allocations; the rows are removed in the next statement anyway.
+        # Detach both incoming and outgoing links, preserving unrelated rows
+        # in either correction chain.
+        Payment.objects.filter(correction_of=payment).update(correction_of=None)
+        Payment.objects.filter(pk=payment.pk).update(correction_of=None)
+        PaymentAllocation.objects.filter(
+            correction_of__payment=payment
+        ).update(correction_of=None)
         PaymentAllocation.objects.filter(payment=payment).update(correction_of=None)
         try:
             PaymentAllocation.objects.filter(payment=payment).delete()

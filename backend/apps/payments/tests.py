@@ -2150,7 +2150,7 @@ class APITests(FinancialTestBase):
         self.assertEqual(rows[self.P2[0].isoformat()]["paid"], "300.00")
         self.assertTrue(conservation_report(self.driver)["all_ok"])
 
-    def test_delete_correction_chain_is_blocked(self):
+    def test_manager_can_delete_corrected_payment_and_preserve_its_correction(self):
         original = self.receive(400, self.P1)
         replacement = services.correct_payment(
             payment=original,
@@ -2159,16 +2159,67 @@ class APITests(FinancialTestBase):
             new_amount=D("500"),
             target_period=self.P1,
         )
+        another_payment = self.receive(100, self.P2)
 
         response = self.client.delete(f"/api/payments/{original.id}/")
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(response.data["code"], "payment_has_corrections")
-        self.assertTrue(Payment.objects.filter(pk=original.id).exists())
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT, response.data)
+        self.assertFalse(Payment.objects.filter(pk=original.id).exists())
+        self.assertTrue(Payment.objects.filter(pk=replacement.id).exists())
+        self.assertTrue(Payment.objects.filter(pk=another_payment.id).exists())
+        self.assertTrue(Driver.objects.filter(pk=self.driver.id).exists())
+        replacement.refresh_from_db()
+        self.assertIsNone(replacement.correction_of_id)
+
+        audit = ActivityLog.objects.get(
+            action="payment_delete", target_id=str(original.id)
+        )
+        self.assertEqual(audit.before_data["corrections"], [replacement.id])
+        self.assertEqual(audit.before_data["driver_name"], self.driver.full_name)
+        self.assertEqual(audit.before_data["amount"], "400.00")
+
+    def test_manager_can_delete_correction_payment_and_unlink_allocations(self):
+        original = self.receive(400, self.P1)
+        replacement = services.correct_payment(
+            payment=original,
+            user=self.user,
+            reason="اصلاح برای تست حذف پرداخت اصلاحی",
+            new_amount=D("500"),
+            target_period=self.P1,
+        )
+        original_allocation_ids = list(
+            original.allocations.values_list("id", flat=True)
+        )
+        replacement_allocations = list(replacement.allocations.all())
+        self.assertTrue(original_allocation_ids)
+        self.assertTrue(replacement_allocations)
+        self.assertEqual(replacement.correction_of_id, original.id)
 
         response = self.client.delete(f"/api/payments/{replacement.id}/")
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(response.data["code"], "payment_is_correction")
-        self.assertTrue(Payment.objects.filter(pk=replacement.id).exists())
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT, response.data)
+        self.assertFalse(Payment.objects.filter(pk=replacement.id).exists())
+        self.assertTrue(Payment.objects.filter(pk=original.id).exists())
+        self.assertTrue(Driver.objects.filter(pk=self.driver.id).exists())
+        original.refresh_from_db()
+        self.assertEqual(original.status, PaymentStatus.CORRECTED)
+        self.assertIsNone(original.correction_of_id)
+        self.assertFalse(
+            PaymentAllocation.objects.filter(payment_id=replacement.id).exists()
+        )
+        self.assertTrue(
+            PaymentAllocation.objects.filter(
+                id__in=original_allocation_ids, payment_id=original.id
+            ).exists()
+        )
+
+        audit = ActivityLog.objects.get(
+            action="payment_delete", target_id=str(replacement.id)
+        )
+        self.assertEqual(audit.before_data["correction_of"], original.id)
+        self.assertEqual(audit.before_data["allocation_corrections"], [])
+
+        revenue = cash_revenue_report()
+        self.assertEqual(revenue["payment_count"], 0)
+        self.assertEqual(revenue["cash_revenue"], "0.00")
 
     def test_reversal_error_code_w9_hint(self):
         t = self.transfer(300, self.P1, self.P2)
