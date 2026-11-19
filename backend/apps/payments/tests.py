@@ -54,6 +54,7 @@ from .reporting import (
     cash_revenue_report,
     conservation_report,
     driver_financial_summary,
+    driver_period_coverage,
     financial_report,
 )
 from .services import FinancialError
@@ -2043,10 +2044,131 @@ class APITests(FinancialTestBase):
         response = self.client.post(f"/api/payments/{payment.id}/void/", {}, format="json")
         self.assertEqual(response.status_code, 400)
 
-    def test_no_delete_endpoint(self):
+    def test_manager_can_delete_payment_and_its_children(self):
         payment = self.receive(600, self.P1)
+        allocation_ids = list(payment.allocations.values_list("id", flat=True))
+        self.assertTrue(allocation_ids)
+
         response = self.client.delete(f"/api/payments/{payment.id}/")
-        self.assertEqual(response.status_code, 405)
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Payment.objects.filter(pk=payment.id).exists())
+        self.assertFalse(
+            PaymentAllocation.objects.filter(id__in=allocation_ids).exists()
+        )
+        # The driver is untouched; only the payment and its own children go.
+        self.assertTrue(Driver.objects.filter(pk=self.driver.id).exists())
+        self.assertTrue(
+            ActivityLog.objects.filter(
+                action="payment_delete", target_id=str(payment.id)
+            ).exists()
+        )
+
+    def test_delete_payment_removes_credit_consumptions(self):
+        payment = self.legacy_credit(100)
+        credit = payment.allocations.get()
+        services.consume_credit(
+            source_allocation=credit,
+            amount=D("100"),
+            target_period=self.P2,
+            user=self.user,
+        )
+        self.assertEqual(self.state(self.P2).balance, D("500"))
+
+        response = self.client.delete(f"/api/payments/{payment.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(
+            AllocationConsumption.objects.filter(
+                source_allocation__payment_id=payment.id
+            ).exists()
+        )
+        self.assertFalse(PaymentAllocation.objects.filter(payment_id=payment.id).exists())
+        self.assertEqual(self.state(self.P2).balance, D("600"))
+
+    def test_delete_payment_removes_refunds(self):
+        payment = self.receive(600, self.P1)
+        services.refund_payment(
+            payment=payment,
+            amount=D("200"),
+            refund_date=FIXED_TODAY,
+            user=self.user,
+            reason="برگشت برای تست حذف",
+        )
+        self.assertTrue(PaymentRefund.objects.filter(payment_id=payment.id).exists())
+
+        response = self.client.delete(f"/api/payments/{payment.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PaymentRefund.objects.filter(payment_id=payment.id).exists())
+
+    def test_delete_nonexistent_payment_returns_404(self):
+        response = self.client.delete("/api/payments/999999/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_guest_cannot_delete_payment(self):
+        payment = self.receive(600, self.P1)
+        guest = User.objects.create_user(username="delete-guest", password="pass")
+        self.client.force_authenticate(user=guest)
+
+        response = self.client.delete(f"/api/payments/{payment.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Payment.objects.filter(pk=payment.id).exists())
+
+    def test_deleted_payment_disappears_from_all_reports(self):
+        deleted = self.receive(600, self.P1)
+        kept = self.receive(300, self.P2)
+
+        response = self.client.delete(f"/api/payments/{deleted.id}/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        # Other payments and the driver are untouched.
+        self.assertTrue(Payment.objects.filter(pk=kept.id).exists())
+        self.assertTrue(Driver.objects.filter(pk=self.driver.id).exists())
+
+        revenue = cash_revenue_report()
+        self.assertEqual(revenue["payment_count"], 1)
+        self.assertEqual(revenue["cash_revenue"], "300.00")
+
+        report = financial_report()
+        self.assertEqual(report["payments"]["count"], 1)
+        self.assertEqual(report["payments"]["total_amount"], "300.00")
+
+        listing = self.client.get("/api/payments/")
+        listed_ids = [row["id"] for row in listing.data["results"]]
+        self.assertNotIn(deleted.id, listed_ids)
+        self.assertIn(kept.id, listed_ids)
+
+        summary = self.client.get(f"/api/drivers/{self.driver.id}/financial-summary/")
+        self.assertEqual(summary.status_code, status.HTTP_200_OK)
+        self.assertEqual(summary.data["cash_received"], "300.00")
+
+        coverage = driver_period_coverage(self.driver)
+        rows = {row["start"]: row for row in coverage["periods"]}
+        self.assertEqual(rows[self.P1[0].isoformat()]["paid"], "0.00")
+        self.assertEqual(rows[self.P2[0].isoformat()]["paid"], "300.00")
+        self.assertTrue(conservation_report(self.driver)["all_ok"])
+
+    def test_delete_correction_chain_is_blocked(self):
+        original = self.receive(400, self.P1)
+        replacement = services.correct_payment(
+            payment=original,
+            user=self.user,
+            reason="اصلاح برای تست حذف",
+            new_amount=D("500"),
+            target_period=self.P1,
+        )
+
+        response = self.client.delete(f"/api/payments/{original.id}/")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["code"], "payment_has_corrections")
+        self.assertTrue(Payment.objects.filter(pk=original.id).exists())
+
+        response = self.client.delete(f"/api/payments/{replacement.id}/")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["code"], "payment_is_correction")
+        self.assertTrue(Payment.objects.filter(pk=replacement.id).exists())
 
     def test_reversal_error_code_w9_hint(self):
         t = self.transfer(300, self.P1, self.P2)

@@ -1,13 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { ArrowRightIcon, CalendarIcon, RefreshIcon, SearchIcon } from '../components/icons'
+import {
+  AlertTriangleIcon,
+  ArrowRightIcon,
+  CalendarIcon,
+  RefreshIcon,
+  SearchIcon,
+} from '../components/icons'
 import { Button } from '../components/ui/Button'
 import { EmptyState } from '../components/ui/EmptyState'
 import { Pagination } from '../components/ui/Pagination'
+import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
-import { fetchPayments } from '../lib/api'
+import { deletePayment, fetchPayments } from '../lib/api'
 import { formatJalaliShort, toPersianDigits } from '../lib/dates'
 import { getErrorMessage, isAbortError } from '../lib/errors'
+import { applyListChange, DEFAULT_PAGE_SIZE, pageAfterDeletion } from '../lib/pagination'
 import type { PaymentListItem, PaymentListParams } from '../types/financial'
 
 const ALLOCATION_TYPE_LABELS: Record<string, string> = {
@@ -43,12 +51,16 @@ function statusClass(value: string): string {
 
 export function FinancialHistoryPage() {
   const { notify } = useToast()
+  const { user } = useAuth()
+  const canDelete = Boolean(user?.is_staff || user?.is_superuser)
   const [searchParams, setSearchParams] = useSearchParams()
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [payments, setPayments] = useState<PaymentListItem[]>([])
   const [totalCount, setTotalCount] = useState(0)
+  const [deletingPayment, setDeletingPayment] = useState<PaymentListItem | null>(null)
+  const [deleting, setDeleting] = useState(false)
   const abortControllerRef = useRef<AbortController | null>(null)
 
   const [filters, setFilters] = useState<PaymentListParams>(() => {
@@ -62,7 +74,7 @@ export function FinancialHistoryPage() {
       date_to: dateTo || undefined,
       search: search || undefined,
       page: 1,
-      page_size: 25,
+      page_size: DEFAULT_PAGE_SIZE,
     }
   })
 
@@ -102,7 +114,7 @@ export function FinancialHistoryPage() {
   }, [load])
 
   const handleFilterChange = (next: Partial<PaymentListParams>) => {
-    const updated: PaymentListParams = { ...filters, ...next, page: 1 }
+    const updated = applyListChange(filters, next)
     setFilters(updated)
     const params = new URLSearchParams(searchParams)
     for (const [key, value] of Object.entries(updated)) {
@@ -115,7 +127,29 @@ export function FinancialHistoryPage() {
     setSearchParams(params)
   }
 
-  const totalPages = Math.max(1, Math.ceil(totalCount / (filters.page_size ?? 25)))
+  const handleDelete = async () => {
+    if (!deletingPayment || deleting) return
+    const target = deletingPayment
+    setDeleting(true)
+    try {
+      await deletePayment(target.id)
+      notify('success', 'پرداخت با موفقیت حذف شد.')
+      setDeletingPayment(null)
+      const page = filters.page ?? 1
+      const nextPage = pageAfterDeletion(page, payments.length)
+      if (nextPage !== page) {
+        handleFilterChange({ page: nextPage })
+      } else {
+        await load()
+      }
+    } catch (cause) {
+      notify('error', getErrorMessage(cause))
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  const totalPages = Math.max(1, Math.ceil(totalCount / (filters.page_size ?? DEFAULT_PAGE_SIZE)))
 
   const activeFilters = useMemo(() => {
     const items: Array<{ label: string; value: string }> = []
@@ -232,7 +266,7 @@ export function FinancialHistoryPage() {
               variant="secondary"
               size="sm"
               onClick={() => {
-                setFilters({ driver_id: undefined, date_from: undefined, date_to: undefined, search: undefined, page: 1, page_size: 25 })
+                setFilters({ driver_id: undefined, date_from: undefined, date_to: undefined, search: undefined, page: 1, page_size: DEFAULT_PAGE_SIZE })
                 setSearchParams(new URLSearchParams())
               }}
               disabled={activeFilters.length === 0}
@@ -266,7 +300,7 @@ export function FinancialHistoryPage() {
           </div>
         ) : (
           <div className="overflow-x-auto p-5">
-            <table className="w-full min-w-[900px] text-sm">
+            <table className="w-full min-w-[980px] text-sm">
               <thead className="bg-slate-50 text-xs text-slate-500">
                 <tr>
                   <th className="px-5 py-2.5 text-right font-medium">راننده</th>
@@ -276,6 +310,7 @@ export function FinancialHistoryPage() {
                   <th className="px-5 py-2.5 text-right font-middle" dir="ltr">شماره رسید</th>
                   <th className="px-5 py-2.5 text-left text-sm text-slate-500">تخصیص به دوره</th>
                   <th className="px-5 py-2.5 text-left text-sm text-slate-500">جزئیات</th>
+                  <th className="px-5 py-2.5 text-left text-sm text-slate-500">عملیات</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -341,6 +376,18 @@ export function FinancialHistoryPage() {
                           مشاهده / اصلاح
                         </Link>
                       </td>
+                      <td className="px-5 py-3 text-left">
+                        {canDelete && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="text-rose-600 hover:bg-rose-50 hover:text-rose-700"
+                            onClick={() => setDeletingPayment(p)}
+                          >
+                            حذف
+                          </Button>
+                        )}
+                      </td>
                     </tr>
                   )
                 })}
@@ -358,6 +405,88 @@ export function FinancialHistoryPage() {
           }}
         />
       </section>
+
+      {deletingPayment && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-payment-title"
+          onClick={() => {
+            if (!deleting) setDeletingPayment(null)
+          }}
+        >
+          <div
+            className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-5 shadow-xl"
+            dir="rtl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <div className="flex size-10 shrink-0 items-center justify-center rounded-full bg-rose-50 text-rose-600">
+                <AlertTriangleIcon className="size-5" />
+              </div>
+              <div>
+                <h2
+                  id="delete-payment-title"
+                  className="text-sm font-semibold text-slate-900"
+                >
+                  حذف دائمی پرداخت
+                </h2>
+                <p className="mt-1 text-xs leading-5 text-slate-500">
+                  این عملیات بازگشت‌ناپذیر است. پرداخت و تخصیص‌های مرتبط با آن از
+                  همه فهرست‌ها و گزارش‌ها حذف می‌شوند.
+                </p>
+              </div>
+            </div>
+
+            <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 rounded-xl bg-slate-50 px-3.5 py-3 text-xs">
+              <div>
+                <dt className="text-slate-400">راننده</dt>
+                <dd className="mt-0.5 font-medium text-slate-700">
+                  {deletingPayment.driver_code} — {deletingPayment.driver_name}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-slate-400">مبلغ</dt>
+                <dd className="mt-0.5 font-mono font-medium text-slate-700" dir="ltr">
+                  {toPersianDigits(deletingPayment.amount)} AFN
+                </dd>
+              </div>
+              <div>
+                <dt className="text-slate-400">تاریخ پرداخت</dt>
+                <dd className="mt-0.5 font-medium text-slate-700">
+                  {formatJalaliShort(deletingPayment.payment_date)}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-slate-400">شماره رسید</dt>
+                <dd className="mt-0.5 font-medium text-slate-700" dir="ltr">
+                  {deletingPayment.receipt_number || '—'}
+                </dd>
+              </div>
+            </dl>
+
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => setDeletingPayment(null)}
+                disabled={deleting}
+              >
+                انصراف
+              </Button>
+              <Button
+                variant="danger"
+                size="sm"
+                loading={deleting}
+                onClick={handleDelete}
+              >
+                حذف دائمی
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

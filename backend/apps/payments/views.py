@@ -1,7 +1,9 @@
 """Financial API views (§10). IsAuthenticated + CSRF; actors from request.user.
 
-No DELETE endpoints exist. Status changes only via action endpoints with a
-required reason. FinancialError → 400 {detail, code}; lock contention → 409.
+The only DELETE endpoint is the manager-only hard delete of a single payment
+(``DELETE /api/payments/<pk>/``). Every other status change goes through an
+action endpoint with a required reason. FinancialError → 400 {detail, code};
+lock contention → 409.
 """
 
 from django.db import IntegrityError, OperationalError, transaction, models
@@ -109,6 +111,8 @@ class FinancialAPIView(APIView):
                 status=status.HTTP_409_CONFLICT,
             )
         if serializer_class is None:
+            if status_code == status.HTTP_204_NO_CONTENT:
+                return Response(status=status_code)
             return Response(result, status=status_code)
         return Response(serializer_class(result).data, status=status_code)
 
@@ -178,6 +182,18 @@ class PaymentListCreateView(FinancialAPIView, generics.ListAPIView):
 class PaymentDetailView(FinancialAPIView, generics.RetrieveAPIView):
     serializer_class = PaymentSerializer
     queryset = Payment.objects.select_related("driver").prefetch_related("refunds")
+
+    def get_permissions(self):
+        if self.request.method == "DELETE":
+            return [IsManager()]
+        return [IsAuthenticated()]
+
+    def delete(self, request, pk):
+        payment = get_object_or_404(Payment, pk=pk)
+        return self.call_service(
+            lambda: services.delete_payment(payment=payment, user=request.user),
+            status_code=status.HTTP_204_NO_CONTENT,
+        )
 
 
 class PaymentVoidView(FinancialAPIView):

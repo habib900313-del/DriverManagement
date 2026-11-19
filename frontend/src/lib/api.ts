@@ -671,6 +671,10 @@ export async function fetchPayment(
   return request<PaymentListItem>(`/payments/${paymentId}/`, { signal })
 }
 
+export async function deletePayment(paymentId: number): Promise<void> {
+  return request(`/payments/${paymentId}/`, { method: 'DELETE' })
+}
+
 export async function voidPayment(
   paymentId: number,
   reason: string,

@@ -11,6 +11,7 @@ from datetime import date
 from decimal import Decimal
 
 from django.db import IntegrityError, transaction
+from django.db.models.deletion import ProtectedError
 from django.utils import timezone
 
 from .ledger import DriverLedger, ZERO
@@ -473,6 +474,124 @@ def void_payment(*, payment: Payment, user, reason: str) -> Payment:
             },
         )
         return payment
+
+
+# ---------------------------------------------------------------------------
+# Hard delete (manager-only, explicit exception to the append-only rule)
+# ---------------------------------------------------------------------------
+def delete_payment(*, payment: Payment, user) -> dict:
+    """Permanently delete a payment and the records that belong to it.
+
+    This is the only hard-delete path in the financial domain. It is an
+    explicit exception to the append-only rule, so it is deliberately narrow:
+
+    * the driver row is locked first, exactly like every other financial
+      operation, so a deletion cannot race a payment/refund/correction;
+    * only rows owned by this payment are removed (its allocations, their
+      consumptions, and its refunds) — no other payment or driver is touched;
+    * correction chains are refused: deleting one link would leave the other
+      rows pointing at a missing payment and silently rewrite history;
+    * a full snapshot is written to the append-only activity log inside the
+      same transaction, so the deletion itself stays auditable.
+    """
+    driver_id = payment.driver_id
+    payment_id = payment.pk
+    with transaction.atomic():
+        driver = Driver.objects.select_for_update().get(pk=driver_id)
+        try:
+            payment = Payment.objects.select_for_update().get(pk=payment_id)
+        except Payment.DoesNotExist:
+            raise FinancialError(
+                "پرداخت یافت نشد یا قبلاً حذف شده است.", "payment_not_found"
+            )
+
+        if payment.corrections.exists():
+            raise FinancialError(
+                "این پرداخت دارای پرداخت اصلاحی است و برای حفظ زنجیره سوابق قابل حذف نیست.",
+                "payment_has_corrections",
+            )
+        if payment.correction_of_id is not None:
+            raise FinancialError(
+                "این پرداخت خود یک پرداخت اصلاحی است و قابل حذف نیست.",
+                "payment_is_correction",
+            )
+
+        allocations = list(
+            payment.allocations.order_by("created_at", "id")
+        )
+        refunds = list(payment.refunds.order_by("created_at", "id"))
+        snapshot = {
+            "payment_id": payment.pk,
+            "driver_id": driver.pk,
+            "driver_code": driver.driver_code,
+            "amount": payment.amount,
+            "payment_date": payment.payment_date,
+            "effective_date": payment.effective_date,
+            "receipt_number": payment.receipt_number,
+            "status": payment.status,
+            "allocations": [
+                {
+                    "id": allocation.pk,
+                    "type": allocation.allocation_type,
+                    "amount": allocation.allocated_amount,
+                    "period_start": allocation.target_period_start,
+                    "period_end": allocation.target_period_end,
+                    "reversed": allocation.reversed_at is not None,
+                }
+                for allocation in allocations
+            ],
+            "refunds": [
+                {
+                    "id": refund.pk,
+                    "amount": refund.amount,
+                    "refund_date": refund.refund_date,
+                }
+                for refund in refunds
+            ],
+        }
+
+        # Children first, parents last: every FK in this domain is PROTECT.
+        AllocationConsumption.objects.filter(
+            source_allocation__payment=payment
+        ).delete()
+        # Break the self-referencing correction links before deleting the
+        # allocations; the rows are removed in the next statement anyway.
+        PaymentAllocation.objects.filter(payment=payment).update(correction_of=None)
+        try:
+            PaymentAllocation.objects.filter(payment=payment).delete()
+        except ProtectedError:
+            raise FinancialError(
+                "تخصیص این پرداخت در رکورد دیگری استفاده شده و قابل حذف نیست.",
+                "payment_allocation_protected",
+            )
+        PaymentRefund.objects.filter(payment=payment).delete()
+        try:
+            Payment.objects.filter(pk=payment.pk).delete()
+        except ProtectedError:
+            raise FinancialError(
+                "این پرداخت در رکورد دیگری استفاده شده و قابل حذف نیست.",
+                "payment_protected",
+            )
+
+        log_activity(
+            actor=user,
+            action="payment_delete",
+            module=ActivityLog.Module.PAYMENTS,
+            description=f"حذف دائمی پرداخت برای راننده «{driver.full_name}».",
+            target_type="payment",
+            target_id=payment_id,
+            target_label=f"{driver.driver_code} — {driver.full_name}",
+            before_data=snapshot,
+            after_data={"deleted": True, "payment_id": payment_id},
+        )
+
+        return {
+            "id": payment_id,
+            "driver_id": driver_id,
+            "amount": snapshot["amount"],
+            "deleted_allocations": len(allocations),
+            "deleted_refunds": len(refunds),
+        }
 
 
 # ---------------------------------------------------------------------------
