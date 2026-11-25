@@ -20,15 +20,23 @@ import { Pagination } from '../components/ui/Pagination'
 import { Spinner } from '../components/ui/Spinner'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
-import { archiveDriver, fetchDrivers, setDriverStatus } from '../lib/api'
+import { archiveDriver, fetchDrivers, fetchFinancialSummary, setDriverStatus } from '../lib/api'
 import { cn } from '../lib/cn'
 import { formatJalaliShort, toPersianDigits } from '../lib/dates'
+import {
+  DRIVER_FINANCIAL_STATUS_STYLES,
+  getDriverFinancialStatus,
+  getDriverFinancialStatusLabel,
+  parseMoney,
+} from '../lib/driverFinancialStatus'
 import { getErrorMessage, isAbortError } from '../lib/errors'
 import type { Driver, PaginatedResponse } from '../types/driver'
+import type { DriverFinancialSummary } from '../types/financial'
 
 const PAGE_SIZE = 10
 
 type StatusFilter = '' | 'active' | 'inactive'
+type SerialOrder = 'asc' | 'desc'
 
 const statusOptions: Array<{ value: StatusFilter; label: string }> = [
   { value: '', label: 'همه' },
@@ -36,18 +44,97 @@ const statusOptions: Array<{ value: StatusFilter; label: string }> = [
   { value: 'inactive', label: 'غیرفعال' },
 ]
 
+const serialOrderOptions: Array<{ value: SerialOrder; label: string }> = [
+  { value: 'asc', label: 'صعودی' },
+  { value: 'desc', label: 'نزولی' },
+]
+
+const FINANCIAL_STATUS_ORDER = ['overdue', 'debtor', 'paid', 'unknown'] as const
+
+function FinancialStatusCell({
+  summary,
+  loading,
+}: {
+  summary?: DriverFinancialSummary
+  loading: boolean
+}) {
+  if (loading) {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-400">
+        <Spinner className="size-3.5" />
+        در حال محاسبه…
+      </span>
+    )
+  }
+
+  if (!summary) {
+    return <span className="text-[11px] text-slate-400">نامشخص</span>
+  }
+
+  const status = getDriverFinancialStatus(summary)
+  const style = DRIVER_FINANCIAL_STATUS_STYLES[status]
+  const label = getDriverFinancialStatusLabel(summary)
+  const availableCredit = parseMoney(summary.available_credit)
+
+  return (
+    <div
+      className="flex flex-col items-start gap-1"
+      title={[
+        `بدهی معوق: ${toPersianDigits(summary.overdue_debt)} AFN`,
+        `مانده دوره جاری: ${toPersianDigits(summary.current_obligation)} AFN`,
+        `مانده کل: ${toPersianDigits(summary.driver_total_balance)} AFN`,
+      ].join(' — ')}
+    >
+      <span
+        className={cn(
+          'inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium',
+          style.badge,
+        )}
+      >
+        <span
+          className={cn('size-1.5 rounded-full', style.dot)}
+          aria-hidden="true"
+        />
+        {label}
+      </span>
+      {status === 'unknown' ? (
+        <span className="text-[11px] text-slate-500">
+          اطلاعات مالی معتبر در دسترس نیست
+        </span>
+      ) : status === 'paid' ? (
+        availableCredit !== null && availableCredit > 0 ? (
+          <span className="text-[11px] text-emerald-700">
+            اعتبار: {toPersianDigits(summary.available_credit)} AFN
+          </span>
+        ) : (
+          <span className="text-[11px] text-slate-400">بدون بدهی</span>
+        )
+      ) : (
+        <span className="font-mono text-[11px] text-slate-500" dir="ltr">
+          {toPersianDigits(summary.driver_total_balance)} AFN
+        </span>
+      )}
+    </div>
+  )
+}
+
 export function DriversListPage() {
   const { user } = useAuth()
   const canManage = Boolean(user?.is_staff || user?.is_superuser)
   const [searchInput, setSearchInput] = useState('')
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<StatusFilter>('')
+  const [serialOrder, setSerialOrder] = useState<SerialOrder>('asc')
   const [page, setPage] = useState(1)
   const [data, setData] = useState<PaginatedResponse<Driver> | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<number | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
+  const [summaries, setSummaries] = useState<
+    Record<number, DriverFinancialSummary>
+  >({})
+  const [summariesLoading, setSummariesLoading] = useState(false)
   const { notify } = useToast()
 
   useEffect(() => {
@@ -68,17 +155,53 @@ export function DriversListPage() {
     setError(null)
 
     fetchDrivers(
-      { search, status, page, page_size: PAGE_SIZE },
+      {
+        search,
+        status,
+        serial_order: serialOrder,
+        page,
+        page_size: PAGE_SIZE,
+      },
       controller.signal,
     )
       .then((response) => {
         if (!active) return
         const totalPages = Math.max(1, Math.ceil(response.count / PAGE_SIZE))
         if (page > totalPages) {
+          setSummariesLoading(false)
           setPage(totalPages)
           return
         }
         setData(response)
+
+        const ids = response.results.map((driver) => driver.id)
+        if (ids.length === 0) {
+          setSummariesLoading(false)
+          return
+        }
+        setSummariesLoading(true)
+        Promise.all(
+          ids.map((id) =>
+            fetchFinancialSummary(id, undefined, controller.signal)
+              .then((summary) => [id, summary] as const)
+              .catch(() => null),
+          ),
+        )
+          .then((rows) => {
+            if (!active || controller.signal.aborted) return
+            setSummaries((current) => {
+              const next = { ...current }
+              for (const row of rows) {
+                if (row) next[row[0]] = row[1]
+              }
+              return next
+            })
+          })
+          .finally(() => {
+            if (active && !controller.signal.aborted) {
+              setSummariesLoading(false)
+            }
+          })
       })
       .catch((cause) => {
         if (active && !isAbortError(cause)) {
@@ -93,7 +216,7 @@ export function DriversListPage() {
       active = false
       controller.abort()
     }
-  }, [search, status, page, reloadKey])
+  }, [search, status, serialOrder, page, reloadKey])
 
   const handleToggle = async (driver: Driver) => {
     if (busyId !== null) return
@@ -194,22 +317,54 @@ export function DriversListPage() {
             )}
           </div>
 
-          <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5 text-xs">
-            {statusOptions.map((option) => (
-              <button
-                key={option.value}
-                type="button"
-                onClick={() => setStatus(option.value)}
-                className={cn(
-                  'rounded-md px-3 py-1.5 font-medium transition',
-                  status === option.value
-                    ? 'bg-white text-slate-900 shadow-sm'
-                    : 'text-slate-500 hover:text-slate-700',
-                )}
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="inline-flex items-center gap-2 text-xs">
+              <span className="text-slate-500">ترتیب شماره مسلسل:</span>
+              <div
+                role="group"
+                aria-label="ترتیب شماره مسلسل"
+                className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5"
               >
-                {option.label}
-              </button>
-            ))}
+                {serialOrderOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    aria-pressed={serialOrder === option.value}
+                    onClick={() => {
+                      if (serialOrder === option.value) return
+                      setPage(1)
+                      setSerialOrder(option.value)
+                    }}
+                    className={cn(
+                      'rounded-md px-3 py-1.5 font-medium transition',
+                      serialOrder === option.value
+                        ? 'bg-white text-slate-900 shadow-sm'
+                        : 'text-slate-500 hover:text-slate-700',
+                    )}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5 text-xs">
+              {statusOptions.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setStatus(option.value)}
+                  className={cn(
+                    'rounded-md px-3 py-1.5 font-medium transition',
+                    status === option.value
+                      ? 'bg-white text-slate-900 shadow-sm'
+                      : 'text-slate-500 hover:text-slate-700',
+                  )}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
@@ -239,6 +394,31 @@ export function DriversListPage() {
             </button>
           )}
         </div>
+
+        <div
+          className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 border-t border-slate-100 pt-3 text-[11px] text-slate-600"
+          aria-label="راهنمای رنگ‌بندی وضعیت مالی"
+        >
+          <span className="font-medium text-slate-700">
+            راهنمای وضعیت مالی:
+          </span>
+          {FINANCIAL_STATUS_ORDER.map((status) => {
+            const style = DRIVER_FINANCIAL_STATUS_STYLES[status]
+            return (
+              <span
+                key={status}
+                className="inline-flex items-center gap-1.5"
+                title={style.description}
+              >
+                <span
+                  className={cn('size-2 rounded-full', style.dot)}
+                  aria-hidden="true"
+                />
+                {style.legend}
+              </span>
+            )
+          })}
+        </div>
       </div>
 
       {error ? (
@@ -256,7 +436,7 @@ export function DriversListPage() {
       ) : (
         <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[820px] text-sm">
+            <table className="w-full min-w-[980px] text-sm">
               <thead className="border-b border-slate-200 bg-slate-50/70 text-xs text-slate-500">
                 <tr>
                   <th className="px-4 py-3 text-right font-medium">
@@ -266,6 +446,9 @@ export function DriversListPage() {
                   <th className="px-4 py-3 text-right font-medium">پلیت موتر</th>
                   <th className="px-4 py-3 text-right font-medium">تاریخ ثبت</th>
                   <th className="px-4 py-3 text-right font-medium">وضعیت</th>
+                  <th className="px-4 py-3 text-right font-medium">
+                    وضعیت مالی
+                  </th>
                   <th className="px-4 py-3 text-left font-medium">عملیات</th>
                 </tr>
               </thead>
@@ -292,15 +475,29 @@ export function DriversListPage() {
                           <div className="h-6 w-16 rounded-full bg-slate-100" />
                         </td>
                         <td className="px-4 py-3.5">
+                          <div className="h-6 w-24 rounded-full bg-slate-100" />
+                        </td>
+                        <td className="px-4 py-3.5">
                           <div className="ms-auto h-8 w-24 rounded-lg bg-slate-100" />
                         </td>
                       </tr>
                     ))
-                  : data?.results.map((driver) => (
-                      <tr
-                        key={driver.id}
-                        className="transition hover:bg-slate-50/70"
-                      >
+                  : data?.results.map((driver) => {
+                      const summary = summaries[driver.id]
+                      const financialStatus = summary
+                        ? getDriverFinancialStatus(summary)
+                        : null
+                      return (
+                        <tr
+                          key={driver.id}
+                          className={cn(
+                            'transition',
+                            financialStatus
+                              ? DRIVER_FINANCIAL_STATUS_STYLES[financialStatus]
+                                  .row
+                              : 'hover:bg-slate-50/70',
+                          )}
+                        >
                         <td className="px-4 py-3">
                           <Link
                             to={`/drivers/${driver.id}`}
@@ -339,6 +536,12 @@ export function DriversListPage() {
                         </td>
                         <td className="px-4 py-3">
                           <StatusBadge active={driver.status} />
+                        </td>
+                        <td className="px-4 py-3">
+                          <FinancialStatusCell
+                            summary={summary}
+                            loading={summariesLoading && !summary}
+                          />
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center justify-end gap-1">
@@ -406,7 +609,8 @@ export function DriversListPage() {
                           </div>
                         </td>
                       </tr>
-                    ))}
+                      )
+                    })}
               </tbody>
             </table>
           </div>

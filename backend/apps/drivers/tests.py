@@ -181,6 +181,9 @@ class DriverApiTests(APITestCase):
         self.assertEqual(payment.amount, amount)
         driver = Driver.objects.get(pk=response.data["id"])
         self.assertEqual(driver.period_calendar, Driver.PERIOD_CALENDAR_JALALI)
+        history = DriverFeeHistory.objects.get(driver=driver)
+        self.assertEqual(history.requested_fee_start_date, period_start)
+        self.assertEqual(history.effective_fee_start_date, period_start)
         allocation = payment.allocations.get()
         self.assertEqual(allocation.allocation_type, AllocationType.FEE_PERIOD)
         self.assertEqual(allocation.target_period_start, period_start)
@@ -247,6 +250,54 @@ class DriverApiTests(APITestCase):
         )
         self.assertNotIn("initial_payment_period_end", response.data)
         self.assertFalse(Driver.objects.filter(driver_code="D-INIT-NO-START").exists())
+
+    def test_initial_payment_period_start_must_match_fee_start_date(self):
+        payload = self._initial_payment_payload(
+            "D-INIT-MISMATCH", fee_for_period(date(2026, 11, 9))
+        )
+        payload["fee_start_date"] = "2026-11-10"
+
+        response = self.client.post("/api/drivers/", payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data["initial_payment_period_start"][0],
+            "شروع دوره پرداخت اولیه باید با تاریخ شروع فیس راننده برابر باشد.",
+        )
+        self.assertFalse(
+            Driver.objects.filter(driver_code="D-INIT-MISMATCH").exists()
+        )
+        self.assertFalse(
+            Payment.objects.filter(driver__driver_code="D-INIT-MISMATCH").exists()
+        )
+        self.assertFalse(
+            PaymentAllocation.objects.filter(
+                payment__driver__driver_code="D-INIT-MISMATCH"
+            ).exists()
+        )
+        self.assertFalse(
+            DriverFeeHistory.objects.filter(
+                driver__driver_code="D-INIT-MISMATCH"
+            ).exists()
+        )
+
+    def test_initial_payment_rejects_invalid_or_blank_fee_start_date(self):
+        for value in ("not-a-date", ""):
+            with self.subTest(fee_start_date=value):
+                payload = self._initial_payment_payload(
+                    "D-INIT-BAD-FEE",
+                    fee_for_period(date(2026, 11, 9)),
+                )
+                payload["fee_start_date"] = value
+
+                response = self.client.post(
+                    "/api/drivers/", payload, format="json"
+                )
+
+                self.assertEqual(
+                    response.status_code, status.HTTP_400_BAD_REQUEST
+                )
+                self.assertIn("fee_start_date", response.data)
 
     def test_retried_driver_creation_does_not_duplicate_initial_payment(self):
         payload = self._initial_payment_payload(
@@ -854,6 +905,121 @@ class DriverApiTests(APITestCase):
                 plate_number="BAL 33333",
                 phone="0777333444",
             )
+        )
+
+    def _create_drivers_with_serials(self, serials, inactive=()):
+        for index, serial in enumerate(serials, start=1):
+            Driver.objects.create(
+                **driver_payload(
+                    driver_code=serial,
+                    plate_number=f"SER {index:05d}",
+                    status=serial not in inactive,
+                )
+            )
+
+    def test_driver_list_defaults_to_numeric_serial_order(self):
+        serials = ["D-100", "100", "D-10", "10", "D-9", "9", "D-2", "2"]
+        self._create_drivers_with_serials(serials)
+
+        response = self.client.get("/api/drivers/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [driver["driver_code"] for driver in response.data["results"]],
+            ["2", "D-2", "9", "D-9", "10", "D-10", "100", "D-100"],
+        )
+
+    def test_driver_list_supports_descending_numeric_serial_order(self):
+        serials = ["D-100", "100", "D-10", "10", "D-9", "9", "D-2", "2"]
+        self._create_drivers_with_serials(serials)
+
+        response = self.client.get("/api/drivers/?serial_order=desc")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [driver["driver_code"] for driver in response.data["results"]],
+            ["100", "D-100", "10", "D-10", "9", "D-9", "2", "D-2"],
+        )
+
+    def test_driver_list_places_blank_serials_last(self):
+        self._create_drivers_with_serials(["", "10", "2"])
+
+        response = self.client.get("/api/drivers/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [driver["driver_code"] for driver in response.data["results"]],
+            ["2", "10", ""],
+        )
+
+    def test_descending_serial_order_keeps_blanks_last(self):
+        self._create_drivers_with_serials(["", "10", "2"])
+
+        response = self.client.get("/api/drivers/?serial_order=desc")
+
+        self.assertEqual(
+            [driver["driver_code"] for driver in response.data["results"]],
+            ["10", "2", ""],
+        )
+
+    def test_driver_list_numeric_order_is_stable_across_pages(self):
+        self._create_drivers_with_serials(["D-100", "D-9", "D-2", "D-10"])
+
+        first_page = self.client.get("/api/drivers/?page_size=2&page=1")
+        second_page = self.client.get("/api/drivers/?page_size=2&page=2")
+
+        self.assertEqual(
+            [driver["driver_code"] for driver in first_page.data["results"]],
+            ["D-2", "D-9"],
+        )
+        self.assertEqual(
+            [driver["driver_code"] for driver in second_page.data["results"]],
+            ["D-10", "D-100"],
+        )
+
+    def test_driver_list_search_and_status_filter_keep_numeric_order(self):
+        self._create_drivers_with_serials(
+            ["D-100", "D-9", "D-10", "D-2"],
+            inactive={"D-100", "D-9"},
+        )
+
+        response = self.client.get(
+            "/api/drivers/?search=D-&status=active&page_size=1&page=2"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(
+            [driver["driver_code"] for driver in response.data["results"]],
+            ["D-10"],
+        )
+
+    def test_descending_serial_order_is_preserved_in_search_and_pagination(self):
+        self._create_drivers_with_serials(
+            ["D-100", "D-9", "D-10", "D-2"],
+            inactive={"D-100", "D-2"},
+        )
+
+        response = self.client.get(
+            "/api/drivers/?search=D-&status=active&serial_order=desc"
+            "&page_size=1&page=2"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(
+            [driver["driver_code"] for driver in response.data["results"]],
+            ["D-9"],
+        )
+
+    def test_explicit_driver_ordering_is_preserved(self):
+        self._create_drivers_with_serials(["D-2", "D-10", "D-9"])
+
+        response = self.client.get("/api/drivers/?ordering=-driver_code")
+
+        self.assertEqual(
+            [driver["driver_code"] for driver in response.data["results"]],
+            ["D-9", "D-2", "D-10"],
         )
 
     def test_search_by_name_plate_and_code(self):

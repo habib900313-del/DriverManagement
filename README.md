@@ -150,6 +150,21 @@ confirms Django, PostgreSQL and the Vite proxy are all working.
 This uses Django's built-in `User` model — no custom users table exists. The
 Django admin is available at <http://127.0.0.1:8000/admin/>.
 
+### Recover a superuser password
+
+If an active staff superuser has lost access because its password is
+unavailable, run this command from `backend/` on the authorized machine shell:
+
+```bash
+python manage.py recover_superuser_password <username>
+```
+
+The command confirms the account and username interactively, requests the new
+password twice without echoing it, validates it with Django's configured
+validators, and writes audit records without storing the password. It refuses
+inactive accounts and accounts missing either staff or superuser privileges;
+it does not create accounts or change role flags.
+
 ### Back up the database
 
 ```bash

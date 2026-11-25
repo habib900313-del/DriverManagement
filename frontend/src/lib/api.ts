@@ -280,6 +280,7 @@ export async function fetchDrivers(
     search: params.search,
     status: params.status,
     ordering: params.ordering,
+    serial_order: params.serial_order,
     page: params.page,
     page_size: params.page_size,
   })

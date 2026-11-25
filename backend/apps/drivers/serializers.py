@@ -369,6 +369,20 @@ class DriverSerializer(serializers.ModelSerializer):
                 for field, message in payment_fields:
                     if attrs.get(field) is None:
                         raise serializers.ValidationError({field: message})
+                fee_start_date = attrs.get("fee_start_date")
+                if fee_start_date is None:
+                    raise serializers.ValidationError(
+                        {"fee_start_date": "تاریخ شروع فیس الزامی است."}
+                    )
+                if attrs["initial_payment_period_start"] != fee_start_date:
+                    raise serializers.ValidationError(
+                        {
+                            "initial_payment_period_start": (
+                                "شروع دوره پرداخت اولیه باید با تاریخ شروع فیس "
+                                "راننده برابر باشد."
+                            )
+                        }
+                    )
         return attrs
 
     def validate_address(self, value):

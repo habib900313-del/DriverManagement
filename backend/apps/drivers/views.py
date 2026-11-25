@@ -4,7 +4,8 @@ import mimetypes
 from pathlib import Path
 
 from django.db import IntegrityError, OperationalError, transaction
-from django.db.models import Q
+from django.db.models import Case, CharField, F, Func, IntegerField, Q, Value, When
+from django.db.models.functions import Length, Lower, Substr
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -125,8 +126,66 @@ class DriverListCreateView(generics.ListCreateAPIView):
             field_name = ordering.lstrip("-")
             if field_name in ORDERING_FIELDS:
                 queryset = queryset.order_by(ordering, "-id")
+            return queryset
 
-        return queryset
+        serial_order = params.get("serial_order", "asc").strip().lower()
+        descending = serial_order == "desc"
+        numeric_code = Case(
+            When(driver_code__regex=r"^[0-9]+$", then=F("driver_code")),
+            When(
+                driver_code__iregex=r"^D-[0-9]+$",
+                then=Substr("driver_code", 3),
+            ),
+            default=Value(None, output_field=CharField()),
+            output_field=CharField(),
+        )
+        normalized_numeric_code = Func(
+            numeric_code,
+            Value("0"),
+            function="LTRIM",
+            output_field=CharField(),
+        )
+        numeric_code_pattern = r"^[0-9]+$"
+        prefixed_numeric_code_pattern = r"^D-[0-9]+$"
+
+        return queryset.annotate(
+            _serial_is_missing=Case(
+                When(
+                    Q(driver_code__isnull=True) | Q(driver_code=""),
+                    then=Value(1),
+                ),
+                default=Value(0),
+                output_field=IntegerField(),
+            ),
+            _serial_is_null=Case(
+                When(driver_code__isnull=True, then=Value(1)),
+                default=Value(0),
+                output_field=IntegerField(),
+            ),
+            _serial_is_non_numeric=Case(
+                When(
+                    driver_code__regex=numeric_code_pattern,
+                    then=Value(0),
+                ),
+                When(
+                    driver_code__iregex=prefixed_numeric_code_pattern,
+                    then=Value(0),
+                ),
+                default=Value(1),
+                output_field=IntegerField(),
+            ),
+            # Digit count then lexical digits gives numeric order without casting.
+            _serial_digit_count=Length(normalized_numeric_code),
+            _serial_numeric_value=normalized_numeric_code,
+        ).order_by(
+            "_serial_is_missing",
+            "_serial_is_null",
+            "_serial_is_non_numeric",
+            "-_serial_digit_count" if descending else "_serial_digit_count",
+            "-_serial_numeric_value" if descending else "_serial_numeric_value",
+            Lower("driver_code"),
+            "id",
+        )
 
     def create(self, request, *args, **kwargs):
         try:

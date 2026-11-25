@@ -1,9 +1,14 @@
 """Authentication and role-based access tests."""
 
 from datetime import timedelta
+from io import StringIO
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import Client
+from django.core.exceptions import PermissionDenied
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.test import Client, RequestFactory
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
@@ -349,6 +354,22 @@ class UserManagementTests(APITestCase):
         self.guest.refresh_from_db()
         self.assertTrue(self.guest.check_password("StrongPass-2026!"))
 
+    def test_anonymous_user_cannot_reset_password(self):
+        response = APIClient().post(
+            f"/api/users/{self.guest.pk}/password/",
+            {
+                "new_password": "NewManagedUserPass-2026!",
+                "password_confirmation": "NewManagedUserPass-2026!",
+            },
+            format="json",
+        )
+        self.assertIn(
+            response.status_code,
+            (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN),
+        )
+        self.guest.refresh_from_db()
+        self.assertTrue(self.guest.check_password("StrongPass-2026!"))
+
     def test_password_reset_rejects_mismatch_and_weak_password(self):
         url = f"/api/users/{self.guest.pk}/password/"
         mismatch = self.client.post(
@@ -388,6 +409,30 @@ class DjangoAdminAccessTests(APITestCase):
         response = client.get("/admin/auth/user/")
         self.assertEqual(response.status_code, 200)
 
+    def test_django_admin_password_reset_uses_hash_and_writes_audit(self):
+        client = Client()
+        client.force_login(self.superuser)
+        new_password = "AdminResetPass-2026!"
+
+        response = client.post(
+            f"/admin/auth/user/{self.guest.pk}/password/",
+            {"password1": new_password, "password2": new_password},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.guest.refresh_from_db()
+        self.assertTrue(self.guest.check_password(new_password))
+        self.assertNotEqual(self.guest.password, new_password)
+        self.assertNotIn(new_password, response.content.decode())
+
+        password_audit = UserPasswordChangeAudit.objects.get(target=self.guest)
+        self.assertEqual(password_audit.actor, self.superuser)
+        self.assertEqual(password_audit.actor_username, self.superuser.username)
+        activity = ActivityLog.objects.get(action="user_admin_password_change")
+        self.assertEqual(activity.actor, self.superuser)
+        self.assertEqual(activity.target_label, self.guest.username)
+        self.assertNotIn(new_password, str(activity))
+
     def test_admin_and_guest_cannot_use_django_admin(self):
         for user in (self.admin, self.guest):
             with self.subTest(username=user.username):
@@ -395,6 +440,227 @@ class DjangoAdminAccessTests(APITestCase):
                 client.force_login(user)
                 response = client.get("/admin/auth/user/")
                 self.assertNotEqual(response.status_code, 200)
+
+        inconsistent_superuser = get_user_model().objects.create_user(
+            username="admin-no-staff",
+            password="StrongPass-2026!",
+            is_active=True,
+            is_staff=False,
+            is_superuser=True,
+        )
+        client = Client()
+        client.force_login(inconsistent_superuser)
+        self.assertNotEqual(client.get("/admin/auth/user/").status_code, 200)
+
+    def test_last_active_superuser_cannot_be_deleted(self):
+        from django.contrib import admin
+
+        user_admin = admin.site._registry[get_user_model()]
+        request = RequestFactory().get("/admin/auth/user/")
+        request.user = self.superuser
+
+        self.assertFalse(user_admin.has_delete_permission(request, self.superuser))
+        with self.assertRaises(PermissionDenied):
+            user_admin.delete_model(request, self.superuser)
+        self.assertTrue(get_user_model().objects.filter(pk=self.superuser.pk).exists())
+
+    def test_last_active_superuser_cannot_be_bulk_deleted(self):
+        from django.contrib import admin
+
+        user_admin = admin.site._registry[get_user_model()]
+        request = RequestFactory().get("/admin/auth/user/")
+        request.user = self.superuser
+
+        with self.assertRaises(PermissionDenied):
+            user_admin.delete_queryset(
+                request, get_user_model().objects.filter(pk=self.superuser.pk)
+            )
+        self.assertTrue(get_user_model().objects.filter(pk=self.superuser.pk).exists())
+
+    def test_another_active_superuser_allows_deletion_of_one(self):
+        from django.contrib import admin
+
+        other_superuser = get_user_model().objects.create_superuser(
+            username="admin-root-second", password="StrongPass-2026!"
+        )
+        user_admin = admin.site._registry[get_user_model()]
+        request = RequestFactory().get("/admin/auth/user/")
+        request.user = self.superuser
+
+        self.assertTrue(user_admin.has_delete_permission(request, self.superuser))
+        user_admin.delete_model(request, self.superuser)
+        self.assertFalse(get_user_model().objects.filter(pk=self.superuser.pk).exists())
+        self.assertTrue(
+            get_user_model().objects.filter(pk=other_superuser.pk).exists()
+        )
+
+    def test_last_active_superuser_cannot_be_demoted_or_deactivated(self):
+        from django.contrib import admin
+
+        user_admin = admin.site._registry[get_user_model()]
+        request = RequestFactory().get("/admin/auth/user/")
+        request.user = self.superuser
+        form_class = user_admin.get_form(request, self.superuser)
+        data = {
+            "username": self.superuser.username,
+            "first_name": self.superuser.first_name,
+            "last_name": self.superuser.last_name,
+            "email": self.superuser.email,
+            "is_active": False,
+            "is_staff": False,
+            "is_superuser": False,
+            "date_joined": self.superuser.date_joined,
+        }
+
+        for field in ("is_active", "is_staff", "is_superuser"):
+            with self.subTest(field=field):
+                self.superuser.refresh_from_db()
+                account_changes = data.copy()
+                account_changes[field] = False
+                form = form_class(data=account_changes, instance=self.superuser)
+                self.assertFalse(form.is_valid())
+                self.assertIn("__all__", form.errors)
+        self.superuser.refresh_from_db()
+        self.assertTrue(self.superuser.is_active)
+        self.assertTrue(self.superuser.is_staff)
+        self.assertTrue(self.superuser.is_superuser)
+
+
+class SuperuserPasswordRecoveryCommandTests(APITestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_superuser(
+            username="recovery-root", password="OriginalStrongPass-2026!"
+        )
+
+    class InteractiveStream(StringIO):
+        def isatty(self):
+            return True
+
+    def call_interactive_command(self, *args, **kwargs):
+        with patch("sys.stdin", self.InteractiveStream()):
+            with patch("sys.stdout", self.InteractiveStream()):
+                with patch("sys.stderr", self.InteractiveStream()):
+                    return call_command(*args, **kwargs)
+
+    def run_recovery_command(self, password, confirmed_username=None):
+        output = StringIO()
+        confirmation = confirmed_username or self.user.username
+        with patch("builtins.input", return_value=confirmation):
+            with patch("getpass.getpass", side_effect=[password, password]):
+                self.call_interactive_command(
+                    "recover_superuser_password",
+                    self.user.username,
+                    stdout=output,
+                    stderr=StringIO(),
+                )
+        return output.getvalue()
+
+    def test_command_resets_password_and_audits_without_exposing_secret(self):
+        new_password = "RecoveredRootPass-2026!"
+        output = self.run_recovery_command(new_password)
+
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(new_password))
+        self.assertNotEqual(self.user.password, new_password)
+        self.assertTrue(self.user.is_active)
+        self.assertTrue(self.user.is_staff)
+        self.assertTrue(self.user.is_superuser)
+        self.assertNotIn(new_password, output)
+        self.assertTrue(
+            Client().login(username=self.user.username, password=new_password)
+        )
+
+        password_audit = UserPasswordChangeAudit.objects.get(target=self.user)
+        self.assertIsNone(password_audit.actor)
+        self.assertEqual(password_audit.actor_username, "management-command")
+        activity = ActivityLog.objects.get(action="superuser_password_recovery")
+        self.assertEqual(activity.target_label, self.user.username)
+        self.assertEqual(activity.metadata, {"source": "management_command"})
+        self.assertNotIn(new_password, str(activity))
+
+    def test_command_refuses_noninteractive_streams_before_prompting(self):
+        for noninteractive_stream in ("stdin", "stdout", "stderr"):
+            streams = {
+                "stdin": self.InteractiveStream(),
+                "stdout": self.InteractiveStream(),
+                "stderr": self.InteractiveStream(),
+            }
+            streams[noninteractive_stream] = StringIO()
+            output = StringIO()
+            with self.subTest(stream=noninteractive_stream):
+                with patch("sys.stdin", streams["stdin"]):
+                    with patch("sys.stdout", streams["stdout"]):
+                        with patch("sys.stderr", streams["stderr"]):
+                            with patch("builtins.input") as input_prompt:
+                                with patch("getpass.getpass") as password_prompt:
+                                    with self.assertRaisesMessage(
+                                        CommandError, "requires an interactive terminal"
+                                    ):
+                                        call_command(
+                                            "recover_superuser_password",
+                                            self.user.username,
+                                            stdout=output,
+                                            stderr=StringIO(),
+                                        )
+                input_prompt.assert_not_called()
+                password_prompt.assert_not_called()
+                self.assertEqual(output.getvalue(), "")
+        self.assertFalse(UserPasswordChangeAudit.objects.exists())
+
+    def test_command_refuses_non_superuser_and_inactive_superuser(self):
+        guest = get_user_model().objects.create_user(
+            username="recovery-guest", password="OriginalStrongPass-2026!"
+        )
+        no_staff = get_user_model().objects.create_user(
+            username="recovery-no-staff",
+            password="OriginalStrongPass-2026!",
+            is_staff=False,
+            is_superuser=True,
+        )
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+
+        for username in (guest.username, no_staff.username, self.user.username):
+            with self.subTest(username=username):
+                with patch("getpass.getpass") as hidden_prompt:
+                    with self.assertRaises(CommandError):
+                        self.call_interactive_command(
+                            "recover_superuser_password",
+                            username,
+                            stdout=StringIO(),
+                            stderr=StringIO(),
+                        )
+                hidden_prompt.assert_not_called()
+        self.assertFalse(UserPasswordChangeAudit.objects.exists())
+
+    def test_command_refuses_mismatched_identity_confirmation(self):
+        with patch("builtins.input", return_value="not-the-target"):
+            with patch("getpass.getpass") as hidden_prompt:
+                with self.assertRaises(CommandError):
+                    self.call_interactive_command(
+                        "recover_superuser_password",
+                        self.user.username,
+                        stdout=StringIO(),
+                        stderr=StringIO(),
+                    )
+            hidden_prompt.assert_not_called()
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password("OriginalStrongPass-2026!"))
+
+    def test_command_rejects_weak_password_without_changing_account(self):
+        output = StringIO()
+        with patch("builtins.input", return_value=self.user.username):
+            with patch("getpass.getpass", side_effect=["123", "123"]):
+                with self.assertRaises(CommandError):
+                    self.call_interactive_command(
+                        "recover_superuser_password",
+                        self.user.username,
+                        stdout=output,
+                        stderr=StringIO(),
+                    )
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password("OriginalStrongPass-2026!"))
+        self.assertFalse(UserPasswordChangeAudit.objects.exists())
 
 
 class ActivityLogAccessTests(APITestCase):

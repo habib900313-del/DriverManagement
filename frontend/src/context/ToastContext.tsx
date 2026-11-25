@@ -1,14 +1,23 @@
-import { createContext, useCallback, useReducer, useMemo, useContext } from 'react'
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+} from 'react'
 import type { ReactNode } from 'react'
 import {
   AlertCircleIcon,
+  AlertTriangleIcon,
   CheckCircleIcon,
   InfoIcon,
   XIcon,
 } from '../components/icons'
 import { cn } from '../lib/cn'
 
-export type ToastType = 'success' | 'error' | 'info'
+export type ToastType = 'success' | 'error' | 'info' | 'warning'
 
 interface Toast {
   id: number
@@ -22,23 +31,8 @@ interface ToastContextValue {
 
 const ToastContext = createContext<ToastContextValue | undefined>(undefined)
 
-let nextId = 1
-
-const styles: Record<ToastType, string> = {
-  success: 'border-emerald-200 bg-emerald-50 text-emerald-900',
-  error: 'border-rose-200 bg-rose-50 text-rose-900',
-  info: 'border-brand-200 bg-brand-50 text-brand-900',
-}
-
-const icons: Record<ToastType, ReactNode> = {
-  success: <CheckCircleIcon className="size-5 shrink-0" />,
-  error: <AlertCircleIcon className="size-5 shrink-0" />,
-  info: <InfoIcon className="size-5 shrink-0" />,
-}
-
-// Type for reducer actions
 type ToastAction =
-  | { type: 'ADD'; payload: { type: ToastType; message: string } }
+  | { type: 'ADD'; payload: Toast }
   | { type: 'DISMISS'; payload: { id: number } }
 
 export function useToast(): ToastContextValue {
@@ -52,8 +46,7 @@ export function useToast(): ToastContextValue {
 const toastReducer = (state: Toast[], action: ToastAction) => {
   switch (action.type) {
     case 'ADD':
-      const id = (state.reduce((max, t) => Math.max(max, t.id), 0) || 0) + 1
-      return [...state, { id: id, type: action.payload.type, message: action.payload.message }]
+      return [...state, action.payload]
     case 'DISMISS':
       return state.filter((toast) => toast.id !== action.payload.id)
     default:
@@ -61,8 +54,75 @@ const toastReducer = (state: Toast[], action: ToastAction) => {
   }
 }
 
+const styles: Record<ToastType, string> = {
+  success: 'border-emerald-200 bg-emerald-50 text-emerald-900',
+  error: 'border-rose-200 bg-rose-50 text-rose-900',
+  info: 'border-brand-200 bg-brand-50 text-brand-900',
+  warning: 'border-amber-200 bg-amber-50 text-amber-900',
+}
+
+const icons: Record<ToastType, ReactNode> = {
+  success: <CheckCircleIcon className="size-5 shrink-0" />,
+  error: <AlertCircleIcon className="size-5 shrink-0" />,
+  info: <InfoIcon className="size-5 shrink-0" />,
+  warning: <AlertTriangleIcon className="size-5 shrink-0" />,
+}
+
+function ToastItem({
+  toast,
+  dismiss,
+}: {
+  toast: Toast
+  dismiss: (id: number) => void
+}) {
+  const toastRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const timeout = window.setTimeout(
+      () => dismiss(toast.id),
+      toast.type === 'error' || toast.type === 'warning' ? 8000 : 5000,
+    )
+    const dismissOnOutsideClick = (event: MouseEvent) => {
+      if (
+        event.target instanceof Node &&
+        !toastRef.current?.contains(event.target)
+      ) {
+        dismiss(toast.id)
+      }
+    }
+
+    document.addEventListener('click', dismissOnOutsideClick)
+    return () => {
+      window.clearTimeout(timeout)
+      document.removeEventListener('click', dismissOnOutsideClick)
+    }
+  }, [dismiss, toast.id, toast.type])
+
+  return (
+    <div
+      ref={toastRef}
+      className={cn(
+        'animate-slide-in-left pointer-events-auto flex items-start gap-2.5 rounded-xl border px-3.5 py-3 text-sm shadow-lg backdrop-blur',
+        styles[toast.type],
+      )}
+    >
+      {icons[toast.type]}
+      <p className="flex-1 leading-6">{toast.message}</p>
+      <button
+        type="button"
+        onClick={() => dismiss(toast.id)}
+        className="rounded-md p-0.5 opacity-60 transition:hover:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current"
+        aria-label="بستن پیام"
+      >
+        <XIcon className="size-4" />
+      </button>
+    </div>
+  )
+}
+
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, dispatch] = useReducer(toastReducer, [])
+  const nextId = useRef(0)
 
   const dismiss = useCallback((id: number) => {
     dispatch({ type: 'DISMISS', payload: { id } })
@@ -70,12 +130,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
   const notify = useCallback(
     (type: ToastType, message: string) => {
-      const id = nextId
-      nextId += 1
-      dispatch({ type: 'ADD', payload: { type, message } })
-      window.setTimeout(() => dismiss(id), 5000)
+      const id = ++nextId.current
+      dispatch({ type: 'ADD', payload: { id, type, message } })
     },
-    [dismiss],
+    [],
   )
 
   const value = useMemo<ToastContextValue>(() => ({ notify }), [notify])
@@ -89,24 +147,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         aria-live="polite"
       >
         {toasts.map((toast) => (
-          <div
+          <ToastItem
             key={toast.id}
-            className={cn(
-              'animate-slide-in-left pointer-events-auto flex items-start gap-2.5 rounded-xl border px-3.5 py-3 text-sm shadow-lg backdrop-blur',
-              styles[toast.type],
-            )}
-          >
-            {icons[toast.type]}
-            <p className="flex-1 leading-6">{toast.message}</p>
-            <button
-              type="button"
-              onClick={() => dismiss(toast.id)}
-              className="rounded-md p-0.5 opacity-60 transition:hover:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current"
-              aria-label="بستن پیام"
-            >
-              <XIcon className="size-4" />
-            </button>
-          </div>
+            toast={toast}
+            dismiss={dismiss}
+          />
         ))}
       </div>
     </ToastContext.Provider>

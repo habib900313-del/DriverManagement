@@ -61,6 +61,7 @@ export interface DriverListParams {
   search?: string
   status?: 'active' | 'inactive' | ''
   ordering?: string
+  serial_order?: 'asc' | 'desc'
   page?: number
   page_size?: number
 }

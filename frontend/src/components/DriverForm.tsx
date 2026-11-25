@@ -18,6 +18,7 @@ import { Field, inputClass, textareaClass } from '../components/ui/Field'
 import { useToast } from '../context/ToastContext'
 import {
   ApiError,
+  changeFeeStartDate,
   checkDriverUnique,
   createDriver,
   uploadDocuments,
@@ -28,10 +29,14 @@ import {
   formatGregorianShort,
   formatJalaliLong,
   isValidIsoDate,
-  isValidJalaliQuarterPeriod,
-  jalaliQuarterEnd,
   todayIsoKabul,
 } from '../lib/dates'
+import { deriveFirstFeePeriod } from '../lib/firstFeePeriod'
+import {
+  isFeeStartDateChanged,
+  validateFeeStartDateChange,
+} from '../lib/driverFeeStartDate'
+import type { FeeStartDateChangeErrors } from '../lib/driverFeeStartDate'
 import { getErrorMessage, normalizeDigits } from '../lib/errors'
 import type { Driver, DriverField, DriverPayload } from '../types/driver'
 
@@ -86,6 +91,14 @@ function validate(
     if (!values.tazkira_number.trim()) {
       errors.tazkira_number = 'شماره تذکره الزامی است.'
     }
+    if (
+      !isValidIsoDate(values.fee_start_date) ||
+      values.fee_start_date < '1900-01-01' ||
+      values.fee_start_date > '2100-12-31'
+    ) {
+      errors.fee_start_date =
+        'تاریخ شروع فیس الزامی است و باید یک تاریخ معتبر باشد.'
+    }
   }
   if (!values.plate_number.trim()) {
     errors.plate_number = 'پلیت موتر الزامی است.'
@@ -129,6 +142,9 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
   const [errors, setErrors] = useState<FormErrors>({})
   const [photoError, setPhotoError] = useState<string | undefined>()
   const [formError, setFormError] = useState<string | null>(null)
+  const [feeStartReason, setFeeStartReason] = useState('')
+  const [feeStartErrors, setFeeStartErrors] =
+    useState<FeeStartDateChangeErrors>({})
   const [submitting, setSubmitting] = useState(false)
   const [codeUnlocked, setCodeUnlocked] = useState(false)
   const [unique, setUnique] = useState({
@@ -138,10 +154,11 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
   // Initial payment state
   const [includeInitialPayment, setIncludeInitialPayment] = useState(false)
   const [initialPaymentAmount, setInitialPaymentAmount] = useState('')
-  const [initialPaymentPeriodStart, setInitialPaymentPeriodStart] = useState('')
-  const initialPaymentPeriodEnd = initialPaymentPeriodStart
-    ? jalaliQuarterEnd(initialPaymentPeriodStart)
-    : null
+  // The first fee period is always anchored on the driver's fee start date;
+  // the manager never enters it manually.
+  const firstFeePeriod = deriveFirstFeePeriod(values.fee_start_date)
+  const initialPaymentPeriodStart = firstFeePeriod?.start ?? ''
+  const initialPaymentPeriodEnd = firstFeePeriod?.end ?? null
   const [initialPaymentDate, setInitialPaymentDate] = useState(todayIsoKabul)
   const [initialPaymentErrors, setInitialPaymentErrors] =
     useState<InitialPaymentErrors>({})
@@ -212,6 +229,22 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
       return
     }
 
+    const feeStartChangeErrors = isEdit
+      ? validateFeeStartDateChange(
+          driver!.fee_start_date,
+          values.fee_start_date,
+          feeStartReason,
+        )
+      : {}
+    setFeeStartErrors(feeStartChangeErrors)
+    if (Object.keys(feeStartChangeErrors).length > 0) {
+      notify('error', 'تاریخ شروع فیس یا دلیل تغییر آن را بررسی کنید.')
+      return
+    }
+    const feeStartChanged =
+      isEdit &&
+      isFeeStartDateChanged(driver!.fee_start_date, values.fee_start_date)
+
     if (!isEdit && includeInitialPayment) {
       const paymentErrors: InitialPaymentErrors = {}
       const amount = normalizeDigits(initialPaymentAmount).trim()
@@ -225,20 +258,9 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
         } else if (initialPaymentDate > todayIsoKabul()) {
           paymentErrors.date = 'تاریخ پرداخت نمی‌تواند در آینده باشد.'
         }
-        if (!initialPaymentPeriodStart) {
-          paymentErrors.periodStart = 'تاریخ شروع دوره را انتخاب کنید.'
-        }
-        if (
-          initialPaymentPeriodStart &&
-          initialPaymentPeriodEnd &&
-          !isValidJalaliQuarterPeriod(
-            values.fee_start_date,
-            initialPaymentPeriodStart,
-            initialPaymentPeriodEnd,
-          )
-        ) {
+        if (!firstFeePeriod) {
           paymentErrors.periodStart =
-            'این تاریخ شروع با دوره‌های سه‌ماهه شمسی بر اساس تاریخ شروع فیس مطابقت ندارد.'
+            'تاریخ شروع فیس معتبر نیست؛ دوره اول باید از همان تاریخ آغاز شود.'
         }
       }
       setInitialPaymentErrors(paymentErrors)
@@ -297,6 +319,34 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
       let saved: any
       if (isEdit) {
         saved = await updateDriver(driver!.id, payload)
+        if (feeStartChanged) {
+          try {
+            await changeFeeStartDate(driver!.id, {
+              requested_fee_start_date: values.fee_start_date,
+              reason: feeStartReason.trim(),
+            })
+          } catch (cause) {
+            if (cause instanceof ApiError) {
+              const mapped: FeeStartDateChangeErrors = {}
+              const fieldErrors = cause.fieldErrors as Record<
+                string,
+                string[] | undefined
+              >
+              const dateMessage = fieldErrors['requested_fee_start_date']?.[0]
+              const reasonMessage = fieldErrors['reason']?.[0]
+              if (dateMessage) mapped.date = dateMessage
+              if (reasonMessage) mapped.reason = reasonMessage
+              setFeeStartErrors(mapped)
+            }
+            const message = getErrorMessage(cause)
+            setFormError(
+              `سایر تغییرات راننده ذخیره شد، اما تغییر تاریخ شروع فیس ثبت نشد: ${message}`,
+            )
+            notify('error', message)
+            window.scrollTo({ top: 0, behavior: 'smooth' })
+            return
+          }
+        }
       } else {
         saved = await createDriver(payload)
       }
@@ -323,7 +373,9 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
         notify(
           'success',
           isEdit
-            ? 'تغییرات راننده با موفقیت ذخیره شد.'
+            ? feeStartChanged
+              ? 'تغییرات راننده و تاریخ شروع فیس با موفقیت ذخیره شد.'
+              : 'تغییرات راننده با موفقیت ذخیره شد.'
             : `راننده جدید با موفقیت ثبت شد${completedActions.length ? ` و ${completedActions.join(' و ')}` : ''}.`,
         )
       }
@@ -565,10 +617,47 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
             id="fee_start_date"
             label="تاریخ شروع فیس"
             value={values.fee_start_date}
-            onChange={(iso) => setValue('fee_start_date', iso)}
-            error={fieldError('fee_start_date')}
+            onChange={(iso) => {
+              setValue('fee_start_date', iso)
+              setFeeStartErrors((current) => ({ ...current, date: undefined }))
+            }}
+            error={feeStartErrors.date ?? fieldError('fee_start_date')}
           />
         </div>
+
+        {isEdit &&
+          isFeeStartDateChanged(
+            driver!.fee_start_date,
+            values.fee_start_date,
+          ) && (
+            <div className="mt-5 space-y-2 rounded-xl border border-amber-200 bg-amber-50/60 px-3.5 py-3">
+              <Field
+                label="دلیل تغییر تاریخ شروع فیس"
+                htmlFor="fee_start_reason"
+                required
+                error={feeStartErrors.reason}
+              >
+                <textarea
+                  id="fee_start_reason"
+                  rows={2}
+                  value={feeStartReason}
+                  onChange={(event) => {
+                    setFeeStartReason(event.target.value)
+                    setFeeStartErrors((current) => ({
+                      ...current,
+                      reason: undefined,
+                    }))
+                  }}
+                  className={textareaClass}
+                  placeholder="دلیل این تغییر برای ثبت در سوابق…"
+                />
+              </Field>
+              <p className="text-[11px] leading-5 text-amber-800">
+                تغییر تاریخ شروع فیس فقط از دوره بعدی اعمال می‌شود؛
+                پرداخت‌ها و سوابق مالی قبلی حذف یا بازنویسی نمی‌شوند.
+              </p>
+            </div>
+          )}
       </SectionCard>
 
       {!isEdit && (
@@ -645,21 +734,25 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
           {includeInitialPayment && (
             <SectionCard title="دوره پرداخت">
               <div className="grid gap-4 md:grid-cols-2">
-                <DualDateInput
-                  id="initial_payment_period_start"
+                <Field
                   label="تاریخ شروع دوره"
-                  value={initialPaymentPeriodStart}
-                  onChange={(start) => {
-                    setInitialPaymentPeriodStart(start)
-                    setInitialPaymentErrors((current) => ({
-                      ...current,
-                      periodStart: undefined,
-                    }))
-                  }}
-                  required
+                  htmlFor="initial_payment_period_start"
+                  hint="این مقدار خودکار از «تاریخ شروع فیس» گرفته می‌شود و قابل ویرایش نیست."
                   error={initialPaymentErrors.periodStart}
-                  hint="شروع باید با دوره‌های سه‌ماهه بر اساس تاریخ شروع فیس منطبق باشد."
-                />
+                >
+                  <input
+                    id="initial_payment_period_start"
+                    readOnly
+                    aria-readonly="true"
+                    value={
+                      initialPaymentPeriodStart
+                        ? formatJalaliLong(initialPaymentPeriodStart)
+                        : ''
+                    }
+                    placeholder="تاریخ شروع فیس را در بخش «تاریخ‌ها» وارد کنید"
+                    className={cn(inputClass, 'bg-slate-50 text-slate-600')}
+                  />
+                </Field>
 
                 <Field
                   label="تاریخ پایان دوره"
@@ -675,7 +768,7 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
                         ? formatJalaliLong(initialPaymentPeriodEnd)
                         : ''
                     }
-                    placeholder="پس از انتخاب تاریخ شروع محاسبه می‌شود"
+                    placeholder="خودکار از تاریخ شروع فیس محاسبه می‌شود"
                     className={cn(inputClass, 'bg-slate-50 text-slate-600')}
                   />
                 </Field>
@@ -690,16 +783,16 @@ export function DriverForm({ mode, driver }: DriverFormProps) {
                   <div className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600 ring-1 ring-slate-100">
                     <span className="text-slate-400">شمسی: </span>
                     <span className="font-medium">
-                      {initialPaymentPeriodEnd
-                        ? formatJalaliLong(initialPaymentPeriodEnd)
+                      {initialPaymentPeriodStart && initialPaymentPeriodEnd
+                        ? `${formatJalaliLong(initialPaymentPeriodStart)} تا ${formatJalaliLong(initialPaymentPeriodEnd)}`
                         : '—'}
                     </span>
                   </div>
                   <div className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600 ring-1 ring-slate-100">
                     <span className="text-slate-400">میلادی: </span>
                     <span className="font-medium" dir="ltr">
-                      {initialPaymentPeriodEnd
-                        ? formatGregorianShort(initialPaymentPeriodEnd)
+                      {initialPaymentPeriodStart && initialPaymentPeriodEnd
+                        ? `${formatGregorianShort(initialPaymentPeriodStart)} → ${formatGregorianShort(initialPaymentPeriodEnd)}`
                         : '—'}
                     </span>
                   </div>
